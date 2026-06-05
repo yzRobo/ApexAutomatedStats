@@ -179,3 +179,14 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- Apex tracker specifics ---
+# Personal match data / runtime output (never commit players' logged stats)
+apex_matches.csv
+apex_matches_*.csv
+debug/
+# Built distributable is published via GitHub Releases, not committed
+release/
+*.zip
+# ...but DO track the PyInstaller build recipe (overrides the *.spec rule above)
+!apextracker.spec

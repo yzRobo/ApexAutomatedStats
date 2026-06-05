@@ -1,0 +1,8 @@
+@echo off
+REM Double-click to start the Apex tracker. Leave this window open while you play.
+cd /d "%~dp0"
+set PYTHONIOENCODING=utf-8
+ApexTracker.exe watch
+echo.
+echo Tracker stopped. Press any key to close.
+pause >nul

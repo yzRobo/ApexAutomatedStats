@@ -1,0 +1,139 @@
+{
+  "_comment": "All pixel coordinates are based on a 1920x1080 capture. If your capture resolution differs, set base_width/base_height to match how these were measured (1920x1080) and the tool scales automatically. Tune regions with calibrate mode.",
+  "base_width": 1920,
+  "base_height": 1080,
+  "_capture_help": "Live capture uses Windows Graphics Capture (like OBS). mode 'monitor' (default) captures the whole monitor Apex is on (auto-detected from the Apex window) - this is the smooth path for fullscreen games. mode 'window' captures just the Apex window (works anywhere but can make a fullscreen game stutter). monitor_index is the fallback monitor if Apex isn't found. throttle_ms caps frame delivery (higher = lighter).",
+  "capture": {
+    "mode": "monitor",
+    "exe_names": [
+      "r5apex_dx12.exe",
+      "r5apex.exe"
+    ],
+    "monitor_index": 1,
+    "throttle_ms": 1000
+  },
+  "_low_priority_help": "Run the tracker at below-normal process priority so Windows favors Apex. Recommended true.",
+  "low_priority": true,
+  "poll_seconds": 1.0,
+  "_settle_help": "Seconds to wait after the end-screen banner appears before reading it, so placement/stats are fully drawn (prevents blank/partial rows).",
+  "settle_seconds": 1.5,
+  "_heartbeat_help": "Seconds between 'still watching' status lines so you can tell it's alive. Set 0 to disable.",
+  "heartbeat_seconds": 60,
+  "csv_path": "apex_matches.csv",
+  "_new_file_each_run_help": "false = one running file that accumulates every match (default). true = a new timestamped file each time you start 'watch', e.g. apex_matches_20260604_193512.csv.",
+  "new_file_each_run": false,
+  "value_width": 150,
+  "single_width": 75,
+  "_known_names_help": "Recurring squadmate gamertags. OCR names are snapped to the closest match here (fixes stray glyphs like WhopperGob->WhopperGot). Add your squad's names.",
+  "known_names": [
+    "yzRobo",
+    "UltVaultHunter",
+    "NameJFK",
+    "Rotarynerd",
+    "TCremer22",
+    "SaWaii"
+  ],
+  "name_match_cutoff": 0.8,
+  "detect": {
+    "_comment": "Banner region, used ONLY to recognize the end-of-match summary screen (win = gold CHAMPIONS, any other placement = red SQUAD ELIMINATED). The banner text itself is not stored. A cheap gold/red color check gates a confirming OCR, so OCR does not run during gameplay.",
+    "banner": {
+      "x": 790,
+      "y": 145,
+      "w": 340,
+      "h": 60
+    },
+    "match_texts": [
+      "CHAMPION",
+      "ELIMINAT",
+      "SQUAD"
+    ],
+    "gold_hsv_min": [
+      18,
+      80,
+      110
+    ],
+    "gold_hsv_max": [
+      42,
+      255,
+      255
+    ],
+    "gold_min_ratio": 0.02,
+    "red_hsv_min1": [
+      0,
+      90,
+      90
+    ],
+    "red_hsv_max1": [
+      10,
+      255,
+      255
+    ],
+    "red_hsv_min2": [
+      168,
+      90,
+      90
+    ],
+    "red_hsv_max2": [
+      180,
+      255,
+      255
+    ],
+    "red_min_ratio": 0.12
+  },
+  "header": {
+    "squad_placed": {
+      "x": 1490,
+      "y": 148,
+      "w": 100,
+      "h": 52
+    },
+    "total_kills": {
+      "x": 1660,
+      "y": 148,
+      "w": 190,
+      "h": 52
+    },
+    "session_id": {
+      "x": 0,
+      "y": 992,
+      "w": 380,
+      "h": 86
+    }
+  },
+  "columns": [
+    {
+      "x": 222,
+      "w": 200
+    },
+    {
+      "x": 752,
+      "w": 200
+    },
+    {
+      "x": 1288,
+      "w": 200
+    }
+  ],
+  "rows": {
+    "name": {
+      "y": 322,
+      "h": 36
+    },
+    "kak": {
+      "y": 425,
+      "h": 30
+    },
+    "damage": {
+      "y": 490,
+      "h": 32
+    },
+    "revive": {
+      "y": 609,
+      "h": 33
+    },
+    "respawn": {
+      "y": 671,
+      "h": 33
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# Pinned to the versions verified working together. numpy MUST stay <2 and
+# opencv at 4.10.x — onnxruntime 1.17 needs numpy 1.x, and newer opencv pulls
+# numpy 2. Don't let pip "upgrade" these.
+numpy==1.26.4
+opencv-python==4.10.0.84
+onnxruntime==1.17.1
+rapidocr-onnxruntime==1.4.4
+windows-capture==2.0.0
+supabase==2.31.0
+python-dotenv==1.0.0
+
+# Build-only (not needed at runtime):
+pyinstaller==6.11.1
