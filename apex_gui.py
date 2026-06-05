@@ -41,6 +41,8 @@ STATE_UI = {
     "idle":     ("#888888", "Idle - press Start"),
 }
 
+_UNSET = object()  # distinguishes "no update result yet" from "check failed (None)"
+
 
 class App:
     def __init__(self, root):
@@ -49,7 +51,7 @@ class App:
         self._thread = None
         self._stop = None
         self._latest = {"state": "idle", "event": "tick"}
-        self._update_result = None  # set by the update-check thread
+        self._update_result = _UNSET  # set by the update-check thread (may be None)
 
         root.title(f"Apex Tracker  v{core.__version__}")
         root.geometry("440x560")
@@ -230,9 +232,9 @@ class App:
             self.last_lbl.config(
                 text=f"Last [{lm['time']}]  #{lm['placed']}  {lm['total_kills']} squad kills\n{who}")
 
-        if self._update_result is not None:
+        if self._update_result is not _UNSET:
             self._show_update_result(self._update_result)
-            self._update_result = None
+            self._update_result = _UNSET
 
         self.root.after(500, self._refresh)
 
@@ -280,13 +282,16 @@ class App:
     def _show_update_result(self, tag):
         self.update_btn.config(state="normal")
         if not tag:
-            self.update_lbl.config(text="Couldn't reach GitHub.")
+            self.update_lbl.config(
+                text="Couldn't reach GitHub - try again later.", foreground="#d1242f")
             return
         latest = tag.lstrip("v")
         if latest == core.__version__:
-            self.update_lbl.config(text=f"Up to date (v{core.__version__}).")
+            self.update_lbl.config(
+                text=f"Up to date (v{core.__version__}).", foreground="#2ea043")
         else:
-            self.update_lbl.config(text=f"Update available: {tag}  (click Check to open)")
+            self.update_lbl.config(
+                text=f"Update available: {tag}", foreground="#d1242f")
             if messagebox.askyesno(
                     "Update available",
                     f"You have v{core.__version__}; {tag} is available.\n\nOpen the "
