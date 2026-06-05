@@ -34,6 +34,20 @@ USING IT
 - "Check for updates" tells you if a newer version is available.
 
 ------------------------------------------------------------
+UPDATING
+------------------------------------------------------------
+"Check for updates" will tell you when there's a new version, but it
+does NOT update itself. To update (this keeps your settings + history):
+  1. Close the app.
+  2. Download the new ApexTracker_share.zip and unzip it somewhere.
+  3. Copy ApexTracker.exe, ApexTrackerUI.exe, and the _internal folder
+     from the new unzip into your existing folder, overwriting them.
+  4. Do NOT overwrite config.json, .env, or apex_matches.csv - those are
+     your roster/settings and match history. (Copying only the 3 items
+     in step 3 leaves them untouched.)
+  5. Reopen ApexTrackerUI.exe.
+
+------------------------------------------------------------
 NOTES
 ------------------------------------------------------------
 * First launch: Windows may show a blue "Windows protected your PC"

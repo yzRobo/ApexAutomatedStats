@@ -20,6 +20,23 @@ The app has a Start/Stop button, a live status/heartbeat, a built-in update chec
 and Settings to edit the squad roster + resolution - no need to touch `config.json`.
 Prefer a console? `ApexTracker.exe watch` still works.
 
+## Updating
+The app's **Check for updates** button tells you if a newer version exists and, if
+so, opens the [Releases page](https://github.com/yzRobo/ApexAutomatedStats/releases).
+It does **not** update itself - you swap the files once, which keeps all your data:
+
+1. Click **Stop** (or close the app) so the files aren't in use.
+2. Download the new **`ApexTracker_share.zip`** and unzip it somewhere temporary.
+3. From the new folder, copy **`ApexTracker.exe`**, **`ApexTrackerUI.exe`**, and the
+   **`_internal`** folder into your existing install, overwriting the old ones.
+4. **Leave your own files in place** - `config.json`, `.env`, and `apex_matches.csv`
+   hold your roster/settings and match history, so don't overwrite them. (Copying
+   only the three items in step 3 preserves them automatically.)
+5. Launch `ApexTrackerUI.exe` - Check for updates should now show "Up to date".
+
+Prefer a clean slate? You can instead unzip the new version into a fresh folder and
+copy your old `config.json` (and `apex_matches.csv` if you want the history) into it.
+
 Tuned for 1920x1080, and it **auto-scales to any 16:9 resolution** (1440p, 4K), so
 most setups just work. If your numbers look off, run `ApexTracker.exe setup` to pin
 your resolution, or see [CALIBRATION.md](CALIBRATION.md) to add a profile.
