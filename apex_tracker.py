@@ -9,8 +9,11 @@ the Apex process, never reads game memory, and never sends input to the game.
 Usage:
     py apex_tracker.py shot                 # save one capture to debug/ (prove capture works)
     py apex_tracker.py monitors             # list detected monitors
+    py apex_tracker.py setup                # ask your resolution + save it to config.json
     py apex_tracker.py calibrate [img.png]  # draw crop boxes + OCR them (uses a PNG, or live screen)
     py apex_tracker.py watch                # run the live auto-watcher
+    Any command also accepts --res WIDTHxHEIGHT to force a resolution profile,
+    e.g. py apex_tracker.py calibrate shot.png --res 2560x1440
 
 Config lives in config.json next to this file.
 """
@@ -79,6 +82,36 @@ def load_config():
     # utf-8-sig tolerates a BOM, which some editors / PowerShell add when saving.
     with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8-sig") as f:
         return json.load(f)
+
+
+def save_config(cfg):
+    """Write config.json back (preserves key order and the _comment help keys)."""
+    with open(os.path.join(HERE, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+def apply_profile(cfg, frame_w, frame_h, forced=None):
+    """Pick the region set for the active resolution.
+
+    Profiles live under cfg['profiles']['WIDTHxHEIGHT'] and each carries its own
+    base_width/base_height plus region blocks (header/columns/rows/detect) measured
+    at that native resolution. When the active resolution matches a profile, those
+    regions are used (scaled by ~1.0); otherwise cfg is returned unchanged and the
+    base 1920x1080 regions are scaled to the frame (the default path that already
+    works for any 16:9 resolution). Returns (effective_cfg, active_key_or_None).
+
+    `forced` (e.g. "2560x1440", from config force_resolution or --res) overrides the
+    detected resolution when choosing the profile key.
+    """
+    profiles = cfg.get("profiles") or {}
+    key = forced or f"{frame_w}x{frame_h}"
+    prof = profiles.get(key)
+    if not prof:
+        return cfg, None
+    eff = dict(cfg)
+    eff.update(prof)  # profile supplies base_width/height + region blocks
+    return eff, key
 
 
 def sync_roster_to_supabase(cfg):
@@ -647,11 +680,12 @@ def cmd_monitors():
     print(f"\nApex window: {'found (hwnd %d)' % apex if apex else 'NOT running'}")
 
 
-def cmd_batch(arg):
+def cmd_batch(arg, forced_res=None):
     """Process image file(s) into a CSV for verification. arg is a folder, a
     glob, or a single image. Writes <csv>_samplecheck next to the normal csv."""
     import glob as _glob
     cfg = load_config()
+    forced = forced_res or cfg.get("force_resolution") or None
     if arg and os.path.isdir(arg):
         paths = sorted(_glob.glob(os.path.join(arg, "*.jpg")) + _glob.glob(os.path.join(arg, "*.png")))
     elif arg and any(ch in arg for ch in "*?"):
@@ -672,8 +706,9 @@ def cmd_batch(arg):
                 print(f"skip (unreadable): {path}")
                 continue
             h, wd = frame.shape[:2]
-            scale = scaler(cfg, wd, h)
-            match = extract_match(frame, cfg, scale)
+            cfg_eff, _ = apply_profile(cfg, wd, h, forced)
+            scale = scaler(cfg_eff, wd, h)
+            match = extract_match(frame, cfg_eff, scale)
             if not match["session_id"]:
                 match["session_id"] = match_key(match)  # show the fallback key
             name = os.path.basename(path)
@@ -724,7 +759,7 @@ def draw_boxes(frame, cfg, scale):
     return out
 
 
-def cmd_calibrate(arg):
+def cmd_calibrate(arg, forced_res=None):
     cfg = load_config()
     os.makedirs(DEBUG_DIR, exist_ok=True)
     if arg and os.path.exists(arg):
@@ -739,6 +774,12 @@ def cmd_calibrate(arg):
             print("No frame captured and no valid image path given.")
             return
     h, w = frame.shape[:2]
+    forced = forced_res or cfg.get("force_resolution") or None
+    cfg, prof_key = apply_profile(cfg, w, h, forced)
+    if prof_key:
+        print(f"Region set: profile {prof_key}")
+    else:
+        print(f"Region set: scaling {cfg['base_width']}x{cfg['base_height']} base to {w}x{h}")
     scale = scaler(cfg, w, h)
 
     overlay = draw_boxes(frame, cfg, scale)
@@ -757,9 +798,11 @@ def cmd_calibrate(arg):
               f"dmg={p['damage']} rev={p['revive_given']} resp={p['respawn_given']}")
 
 
-def cmd_watch():
+def cmd_watch(forced_res=None):
     cfg = load_config()
     sync_roster_to_supabase(cfg)
+    forced = forced_res or cfg.get("force_resolution") or None
+    announced = False
     cap_cfg = cfg.get("capture", {})
     exe_names = cap_cfg.get("exe_names", ["r5apex_dx12.exe", "r5apex.exe"])
     path = csv_path(cfg)
@@ -806,11 +849,20 @@ def cmd_watch():
                 time.sleep(poll)
                 continue
             h, w = frame.shape[:2]
-            scale = scaler(cfg, w, h)
+            cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
+            scale = scaler(cfg_eff, w, h)
+            if not announced:
+                announced = True
+                if prof_key:
+                    print(f"Using calibration profile for {prof_key}.")
+                else:
+                    print(f"Resolution {w}x{h}: scaling "
+                          f"{cfg['base_width']}x{cfg['base_height']} regions to fit "
+                          f"(no profile for this resolution).")
 
             # Cheap OCR-free gate every poll. OCR + extraction only happen once per
             # summary, after it has been on screen long enough to finish rendering.
-            if not banner_color_present(frame, cfg, scale):
+            if not banner_color_present(frame, cfg_eff, scale):
                 summary_handled = False
                 banner_since = None
                 time.sleep(poll)
@@ -824,11 +876,11 @@ def cmd_watch():
             if time.time() - banner_since < settle:
                 time.sleep(poll)
                 continue
-            if not banner_text_present(frame, cfg, scale):
+            if not banner_text_present(frame, cfg_eff, scale):
                 time.sleep(poll)   # banner colour but not a summary banner
                 continue
 
-            match = extract_match(frame, cfg, scale)
+            match = extract_match(frame, cfg_eff, scale)
             # Wait until every player is named AND placement has rendered, so we
             # never log a half-drawn screen (the cause of the earlier blank rows).
             if any(not p["name"] for p in match["players"]) or match["squad_placed"] is None:
@@ -853,18 +905,70 @@ def cmd_watch():
         cap.release()
 
 
+def cmd_setup():
+    """Interactive: ask the friend what resolution they run Apex at and save it to
+    config.json, so the matching calibration profile (if any) is used. Run once."""
+    cfg = load_config()
+    base = f"{cfg.get('base_width', 1920)}x{cfg.get('base_height', 1080)}"
+    profiles = cfg.get("profiles") or {}
+    current = cfg.get("force_resolution") or "(auto-detect)"
+    print("Apex Tracker - resolution setup")
+    print(f"Current setting: {current}")
+    if profiles:
+        print(f"Calibration profiles available: {', '.join(sorted(profiles))}")
+    print("\nWhat resolution do you run Apex at in-game?")
+    print("  Common: 1920x1080, 2560x1440, 3440x1440 (ultrawide), 3840x2160")
+    print("  (Leave blank to auto-detect from the screen on every run.)")
+    try:
+        # lstrip the BOM in case input was piped from a UTF-16/BOM source.
+        ans = input("Resolution: ").strip().lstrip(chr(0xFEFF)).strip().lower().replace(" ", "")
+    except EOFError:
+        print("No input received; leaving the setting unchanged.")
+        return
+    if ans == "":
+        cfg.pop("force_resolution", None)
+        save_config(cfg)
+        print("Set to auto-detect. Done.")
+        return
+    if not re.match(r"^\d{3,5}x\d{3,5}$", ans):
+        print(f"'{ans}' is not WIDTHxHEIGHT (e.g. 2560x1440). Nothing changed.")
+        return
+    cfg["force_resolution"] = ans
+    save_config(cfg)
+    if ans in profiles:
+        print(f"Saved {ans}. A calibration profile exists for it and will be used.")
+    elif ans == base:
+        print(f"Saved {ans}. That is the base resolution; regions are used as-is.")
+    else:
+        print(f"Saved {ans}. No exact calibration profile yet - the {base} regions "
+              f"will be auto-scaled to fit. If the numbers look off, see CALIBRATION.md.")
+
+
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "watch"
+    args = sys.argv[1:]
+    # Pull out an optional "--res WIDTHxHEIGHT" override from anywhere in the args.
+    forced_res = None
+    if "--res" in args:
+        i = args.index("--res")
+        if i + 1 < len(args):
+            forced_res = args[i + 1]
+            del args[i:i + 2]
+        else:
+            del args[i]
+    cmd = args[0] if args else "watch"
+    pos = args[1] if len(args) > 1 else None
     if cmd == "monitors":
         cmd_monitors()
     elif cmd == "batch":
-        cmd_batch(sys.argv[2] if len(sys.argv) > 2 else None)
+        cmd_batch(pos, forced_res)
     elif cmd == "shot":
         cmd_shot()
     elif cmd == "calibrate":
-        cmd_calibrate(sys.argv[2] if len(sys.argv) > 2 else None)
+        cmd_calibrate(pos, forced_res)
+    elif cmd == "setup":
+        cmd_setup()
     elif cmd == "watch":
-        cmd_watch()
+        cmd_watch(forced_res)
     else:
         print(__doc__)
 
