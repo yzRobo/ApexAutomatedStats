@@ -14,10 +14,10 @@ Grab the latest **`ApexTracker_share.zip`** from the
 [Releases page](https://github.com/yzRobo/ApexAutomatedStats/releases), unzip it,
 add your in-game name to `known_names` in `config.json`, and double-click
 **`Start Tracker.bat`**. No Python or install required. (Windows SmartScreen may
-warn about the unsigned app the first time: *More info → Run anyway*.) Built for
-1920×1080.
+warn about the unsigned app the first time: *More info -> Run anyway*.) Built for
+1920x1080.
 
-To rebuild the `.exe` yourself, run [`build_release.bat`](build_release.bat) — it
+To rebuild the `.exe` yourself, run [`build_release.bat`](build_release.bat) - it
 runs PyInstaller against [`apextracker.spec`](apextracker.spec) and assembles the
 zip. To run from source without building, see below.
 
