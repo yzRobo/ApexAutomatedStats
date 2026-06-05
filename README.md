@@ -12,9 +12,13 @@ alongside Easy Anti-Cheat; keep it that way (don't add input automation / memory
 ## Download (no Python needed)
 Grab the latest **`ApexTracker_share.zip`** from the
 [Releases page](https://github.com/yzRobo/ApexAutomatedStats/releases), unzip it,
-add your in-game name to `known_names` in `config.json`, and double-click
-**`Start Tracker.bat`**. No Python or install required. (Windows SmartScreen may
-warn about the unsigned app the first time: *More info -> Run anyway*.)
+and double-click **`ApexTrackerUI.exe`** (or `Start Tracker.bat`). No Python or
+install required. (Windows SmartScreen may warn about the unsigned app the first
+time: *More info -> Run anyway*.)
+
+The app has a Start/Stop button, a live status/heartbeat, a built-in update check,
+and Settings to edit the squad roster + resolution - no need to touch `config.json`.
+Prefer a console? `ApexTracker.exe watch` still works.
 
 Tuned for 1920x1080, and it **auto-scales to any 16:9 resolution** (1440p, 4K), so
 most setups just work. If your numbers look off, run `ApexTracker.exe setup` to pin

@@ -1,8 +1,5 @@
 @echo off
-REM Double-click to start the Apex tracker. Leave this window open while you play.
+REM Double-click to open the Apex Tracker app (the window with Start/Stop + status).
+REM You can also just double-click ApexTrackerUI.exe directly.
 cd /d "%~dp0"
-set PYTHONIOENCODING=utf-8
-ApexTracker.exe watch
-echo.
-echo Tracker stopped. Press any key to close.
-pause >nul
+start "" "ApexTrackerUI.exe"

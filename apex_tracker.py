@@ -49,6 +49,24 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
+__version__ = "1.2.0"
+REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
+
+
+def latest_release_version(timeout=4):
+    """Return the latest GitHub release tag (e.g. 'v1.2.0'), or None on failure.
+    Stdlib only; used by the GUI's update check. Never raises."""
+    import urllib.request
+    url = f"https://api.github.com/repos/{REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.github+json",
+                          "User-Agent": "apex-tracker"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r).get("tag_name")
+    except Exception:
+        return None
+
 # Initialize Supabase client if configured.
 # Key preference: a SERVICE_ROLE key (the project owner's own machine — full
 # access, lets roster upsert work) takes priority if present; otherwise the
@@ -332,17 +350,34 @@ def match_key(match):
     return fingerprint(match["players"])
 
 
-def dedup_key(session_id, players=None):
-    """Key used ONLY for dedup. Strips colons/punctuation so the same match isn't
-    logged twice when OCR reads a colon differently between frames. Falls back to a
-    name+damage fingerprint when there's no usable id."""
+def stat_fingerprint(players, squad_placed=None, total_squad_kills=None):
+    """Primary dedup key, built from the stable, reliably-OCR'd values: each player's
+    name + K/A/Kn/damage/revives/respawns, plus placement and total squad kills. The
+    bottom-left session id OCRs inconsistently (a dropped char or merged colon), so it
+    can't be trusted for dedup; these stat fields do not. Accepts player dicts from a
+    live match or rows read back from the CSV (values may be ints or numeric strings;
+    both format identically)."""
+    def g(p, k):
+        v = p.get(k, 0)
+        return "" if v is None else str(v)
+    parts = sorted(
+        "|".join(g(p, k) for k in
+                 ("name", "kills", "assists", "knocks", "damage",
+                  "revive_given", "respawn_given"))
+        for p in players)
+    sp = "" if squad_placed is None else str(squad_placed)
+    tk = "" if total_squad_kills is None else str(total_squad_kills)
+    return f"stat:{sp}|{tk}|" + "_".join(parts)
+
+
+def sid_norm(session_id):
+    """Secondary dedup key: the session id with punctuation stripped, or None when
+    there's no usable real id (a fingerprint placeholder or too-short read)."""
     sid = session_id or ""
     if sid.startswith("fp:"):
-        return sid
+        return None
     norm = re.sub(r"[^0-9A-Za-z]", "", sid)
-    if len(norm) >= 8:
-        return "sid:" + norm
-    return fingerprint(players) if players is not None else sid
+    return "sid:" + norm if len(norm) >= 8 else None
 
 
 # --------------------------------------------------------------------------- #
@@ -596,13 +631,23 @@ def csv_path(cfg):
 
 
 def already_logged_ids(path):
+    """Dedup keys for matches already in the CSV. For each match (its 3 rows share a
+    session_id) it adds both the stat fingerprint and the normalized session id, so a
+    match already logged - even under a differently-OCR'd id - is recognized. Count
+    distinct matches via the 'stat:' keys."""
     seen = set()
-    if os.path.exists(path):
-        with open(path, "r", newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                sid = row.get("session_id")
-                if sid:
-                    seen.add(dedup_key(sid))
+    if not os.path.exists(path):
+        return seen
+    groups = {}
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            groups.setdefault(row.get("session_id") or "", []).append(row)
+    for sid, rows in groups.items():
+        sk = sid_norm(sid)
+        if sk:
+            seen.add(sk)
+        seen.add(stat_fingerprint(rows, rows[0].get("squad_placed"),
+                                  rows[0].get("total_squad_kills")))
     return seen
 
 
@@ -798,24 +843,47 @@ def cmd_calibrate(arg, forced_res=None):
               f"dmg={p['damage']} rev={p['revive_given']} resp={p['respawn_given']}")
 
 
-def cmd_watch(forced_res=None):
-    cfg = load_config()
+def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None):
+    """Core watch loop, shared by the console (cmd_watch) and the GUI.
+
+    Logs each new match to the CSV (and Supabase). Drives any front-end through
+    callbacks instead of printing: status_cb(status) is called frequently with a
+    snapshot dict (state, frame_age, logged_this_run, last_match, ...) carrying an
+    'event' key ('start'/'tick'/'heartbeat'/'reacquire'/'announce'/'log'/'stop');
+    log_cb(last_match) fires once per newly logged match. Runs until stop_event is
+    set. status_cb runs on this thread, so a GUI must marshal back to its own thread
+    (don't touch widgets directly). Returns the count logged this run.
+    """
+    import threading as _th
+    stop_event = stop_event or _th.Event()
     sync_roster_to_supabase(cfg)
     forced = forced_res or cfg.get("force_resolution") or None
-    announced = False
-    cap_cfg = cfg.get("capture", {})
-    exe_names = cap_cfg.get("exe_names", ["r5apex_dx12.exe", "r5apex.exe"])
     path = csv_path(cfg)
     seen = already_logged_ids(path)
     poll = cfg.get("poll_seconds", 1.0)
     if cfg.get("low_priority", True):
         set_below_normal_priority()
 
+    status = {"state": "starting", "src": None, "frame_age": None,
+              "logged_this_run": 0,
+              "already_logged": sum(1 for k in seen if k.startswith("stat:")),
+              "last_match": None, "csv_path": path, "resolution": None,
+              "profile": None, "event": "start"}
+
+    def emit(event):
+        status["event"] = event
+        if status_cb:
+            try:
+                status_cb(dict(status))
+            except Exception:
+                pass
+
+    emit("start")
     cap, src, hwnd = open_live_capture(cfg)
-    if not cap.wait_first(8):
-        print(f"Capturing {src}, but no frame yet. Start Apex (or bring it to screen); "
-              f"I'll keep trying.")
-    print(f"Watching {src}. {len(seen)} matches already logged. Ctrl+C to stop.\nCSV: {path}")
+    status["src"] = src
+    got = cap.wait_first(8)
+    status["state"] = "watching" if got else "waiting"
+    emit("tick")
 
     last_recheck = time.time()
     hb_secs = cfg.get("heartbeat_seconds", 60)
@@ -823,17 +891,14 @@ def cmd_watch(forced_res=None):
     logged_this_run = 0
     summary_handled = False
     banner_since = None
+    absent_since = None
+    announced = False
     settle = cfg.get("settle_seconds", 1.5)
     try:
-        while True:
-            # Heartbeat so you can tell at a glance it's alive and capturing.
-            if hb_secs and time.time() - last_hb >= hb_secs:
-                last_hb = time.time()
-                age = cap.last_frame_age()
-                health = (f"capture OK ({age:.0f}s old frame)" if age < 5
-                          else f"capture STALE ({age:.0f}s) - is Apex visible?")
-                print(f"[{datetime.now():%H:%M:%S}] still watching {src} | {health} | "
-                      f"{logged_this_run} logged this run")
+        while not stop_event.is_set():
+            age = cap.last_frame_age()
+            status["frame_age"] = age
+            status["state"] = "watching" if age < 5 else "stale"
             # Cheaply re-acquire only when needed. During normal play this is just
             # an IsWindow() check (no expensive window scan), so it won't hitch.
             if time.time() - last_recheck > 30:
@@ -842,67 +907,136 @@ def cmd_watch(forced_res=None):
                 if not alive or cap.last_frame_age() > 20:
                     cap.release()
                     cap, src, hwnd = open_live_capture(cfg)
-                    print(f"[{datetime.now():%H:%M:%S}] re-acquired {src}")
+                    status["src"] = src
+                    emit("reacquire")
+            # Heartbeat tick so a front-end can show it is alive and capturing.
+            if hb_secs and time.time() - last_hb >= hb_secs:
+                last_hb = time.time()
+                emit("heartbeat")
+            else:
+                emit("tick")
 
             frame = cap.grab()
             if frame is None:
-                time.sleep(poll)
+                stop_event.wait(poll)
                 continue
             h, w = frame.shape[:2]
             cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
             scale = scaler(cfg_eff, w, h)
             if not announced:
                 announced = True
-                if prof_key:
-                    print(f"Using calibration profile for {prof_key}.")
-                else:
-                    print(f"Resolution {w}x{h}: scaling "
-                          f"{cfg['base_width']}x{cfg['base_height']} regions to fit "
-                          f"(no profile for this resolution).")
+                status["resolution"] = f"{w}x{h}"
+                status["profile"] = prof_key
+                emit("announce")
 
             # Cheap OCR-free gate every poll. OCR + extraction only happen once per
             # summary, after it has been on screen long enough to finish rendering.
             if not banner_color_present(frame, cfg_eff, scale):
-                summary_handled = False
-                banner_since = None
-                time.sleep(poll)
+                if absent_since is None:
+                    absent_since = time.time()
+                # Only arm for a NEW summary once the banner has been gone a few
+                # seconds. A brief 1-frame colour flicker on the same summary must not
+                # reset summary_handled, or the match gets read and logged twice.
+                if time.time() - absent_since >= 3.0:
+                    summary_handled = False
+                    banner_since = None
+                stop_event.wait(poll)
                 continue
+            absent_since = None
             if banner_since is None:
                 banner_since = time.time()
             if summary_handled:
-                time.sleep(poll)
+                stop_event.wait(poll)
                 continue
             # Let the screen settle so placement/total/stats are fully drawn.
             if time.time() - banner_since < settle:
-                time.sleep(poll)
+                stop_event.wait(poll)
                 continue
             if not banner_text_present(frame, cfg_eff, scale):
-                time.sleep(poll)   # banner colour but not a summary banner
+                stop_event.wait(poll)   # banner colour but not a summary banner
                 continue
 
             match = extract_match(frame, cfg_eff, scale)
             # Wait until every player is named AND placement has rendered, so we
             # never log a half-drawn screen (the cause of the earlier blank rows).
             if any(not p["name"] for p in match["players"]) or match["squad_placed"] is None:
-                time.sleep(poll)   # still animating in; retry next poll
+                stop_event.wait(poll)   # still animating in; retry next poll
                 continue
             summary_handled = True  # this summary instance is now processed
             if not match["session_id"]:
                 match["session_id"] = match_key(match)  # persist so restarts dedup
-            dk = dedup_key(match["session_id"], match["players"])
-            if dk not in seen:
-                append_match(path, match)
-                seen.add(dk)
-                logged_this_run += 1
-                names = ", ".join(f"{p['name']}({p['kills']}k/{p['damage']}dmg)"
-                                  for p in match["players"])
-                print(f"[{datetime.now():%H:%M:%S}] logged {match['session_id']}  "
-                      f"#{match['squad_placed']} {match['total_squad_kills']}k -> {names}")
-            time.sleep(poll)
-    except KeyboardInterrupt:
-        print("\nStopped.")
+            # Dedup on the stable stats, not the flaky session id. Skip if this match
+            # was already logged - even if its id OCRs differently this time.
+            sk = sid_norm(match["session_id"])
+            fp = stat_fingerprint(match["players"], match["squad_placed"],
+                                  match["total_squad_kills"])
+            if fp in seen or (sk and sk in seen):
+                stop_event.wait(poll)
+                continue
+            append_match(path, match)
+            seen.add(fp)
+            if sk:
+                seen.add(sk)
+            logged_this_run += 1
+            status["logged_this_run"] = logged_this_run
+            status["last_match"] = {
+                "session_id": match["session_id"],
+                "placed": match["squad_placed"],
+                "total_kills": match["total_squad_kills"],
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "players": [{"name": p["name"], "kills": p["kills"],
+                             "damage": p["damage"]} for p in match["players"]],
+            }
+            emit("log")
+            if log_cb:
+                try:
+                    log_cb(dict(status["last_match"]))
+                except Exception:
+                    pass
+            stop_event.wait(poll)
     finally:
         cap.release()
+        status["state"] = "stopped"
+        emit("stop")
+    return logged_this_run
+
+
+def cmd_watch(forced_res=None):
+    """Console front-end for run_watch: prints the start banner, heartbeats, and
+    each logged match."""
+    cfg = load_config()
+    path = csv_path(cfg)
+    seen_n = sum(1 for k in already_logged_ids(path) if k.startswith("stat:"))
+    print(f"Watching. {seen_n} matches already logged. Ctrl+C to stop.\nCSV: {path}")
+
+    def status_cb(s):
+        ev = s.get("event")
+        if ev == "announce":
+            if s["profile"]:
+                print(f"Using calibration profile for {s['profile']}.")
+            else:
+                print(f"Resolution {s['resolution']}: scaling base regions to fit "
+                      f"(no profile for this resolution).")
+        elif ev == "reacquire":
+            print(f"[{datetime.now():%H:%M:%S}] re-acquired {s['src']}")
+        elif ev == "heartbeat":
+            age = s.get("frame_age") or 0
+            health = (f"capture OK ({age:.0f}s old frame)" if s["state"] == "watching"
+                      else f"capture STALE ({age:.0f}s) - is Apex visible?")
+            print(f"[{datetime.now():%H:%M:%S}] still watching {s['src']} | {health} | "
+                  f"{s['logged_this_run']} logged this run")
+
+    def log_cb(m):
+        names = ", ".join(f"{p['name']}({p['kills']}k/{p['damage']}dmg)" for p in m["players"])
+        print(f"[{datetime.now():%H:%M:%S}] logged {m['session_id']}  "
+              f"#{m['placed']} {m['total_kills']}k -> {names}")
+
+    stop_event = threading.Event()
+    try:
+        run_watch(cfg, forced_res, stop_event=stop_event, status_cb=status_cb, log_cb=log_cb)
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("\nStopped.")
 
 
 def cmd_setup():

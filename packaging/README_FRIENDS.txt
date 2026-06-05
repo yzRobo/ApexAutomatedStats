@@ -11,32 +11,27 @@ OBS uses. Safe to run with Easy Anti-Cheat.
 You do NOT need Python or anything else installed.
 
 ------------------------------------------------------------
-SETUP (one time, 30 seconds)
+SETUP
 ------------------------------------------------------------
 1. Unzip this whole folder somewhere (e.g. your Desktop).
    Keep all the files together - don't move the .exe out on its own.
 
-2. Open  config.json  in Notepad and find "known_names".
-   Add your in-game name to the list, e.g.:
+2. Double-click  ApexTrackerUI.exe  (or Start Tracker.bat).
+   The app window opens.
 
-        "known_names": [
-          "yzRobo",
-          "UltVaultHunter",
-          "YourGamerTagHere"
-        ],
-
-   (This just helps it spell your name right. Save and close.)
+3. In the app's Settings, add your in-game name to the roster
+   (type it in and click "Add name"), pick your Resolution if you
+   want, and click "Save settings".
 
 ------------------------------------------------------------
-RUNNING IT
+USING IT
 ------------------------------------------------------------
-Double-click  Start Tracker.bat  (or  ApexTracker.exe).
-
-A black window opens and says it's watching. Leave it open and go play.
-After each match's summary screen, it logs the stats automatically and
-they show up in our shared squad stats. Close the window to stop.
-
-Your matches are also saved locally to  apex_matches.csv  next to the exe.
+- Click  Start  in the app, then go play. The status dot shows it's
+  watching (green = capture OK). After each match's summary screen,
+  the stats are logged automatically and show up in our shared squad
+  stats. Click  Stop  (or just close the window) when you're done.
+- "Open CSV" shows your matches saved locally (apex_matches.csv).
+- "Check for updates" tells you if a newer version is available.
 
 ------------------------------------------------------------
 NOTES
@@ -45,9 +40,12 @@ NOTES
   box because the app isn't signed. Click "More info" -> "Run anyway".
   (It's just an unsigned app from a friend, not a virus.)
 
-* It's tuned for 1920x1080. If you play at that resolution you're set.
-  Other resolutions may need a quick calibration - ping yzRobo.
+* Built for 1920x1080 and auto-scales to any 16:9 resolution (1440p,
+  4K). If your numbers ever look off, set your Resolution in Settings
+  or ping yzRobo.
 
 * It only does work when the end-of-match summary is on screen, so it
   has basically no impact on your game while you're playing.
+
+* Prefer a plain console instead of the app? Run:  ApexTracker.exe watch
 ============================================================
