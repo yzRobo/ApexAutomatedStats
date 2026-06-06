@@ -31,15 +31,27 @@ import apex_tracker as core
 COMMON_RES = ["1920x1080", "2560x1440", "3440x1440", "3840x2160"]
 AUTO_LABEL = "Auto-detect"
 
-# Capture-mode picker: (menu label, config capture.mode value). "monitor" runs the
-# on-demand WGC path (standalone, brief periodic blip); "obs" reads the OBS Virtual
-# Camera (zero game overhead but needs OBS running).
+# Capture-mode picker: (menu label, (capture.mode, capture.on_demand)).
+#   ("monitor", False) = continuous WGC (reliable; the v1.2.x behavior).
+#   ("monitor", True)  = on-demand WGC (less fullscreen stutter, BETA - can miss end screens).
+#   ("obs", False)     = read the OBS Virtual Camera (zero game overhead, needs OBS).
 CAPTURE_MODES = [
-    ("Standalone - no OBS (brief blip)", "monitor"),
-    ("OBS Virtual Camera - smooth (needs OBS)", "obs"),
+    ("Continuous - reliable (default)", ("monitor", False)),
+    ("On-demand - less stutter (BETA)", ("monitor", True)),
+    ("OBS Virtual Camera - zero stutter (needs OBS)", ("obs", False)),
 ]
-MODE_BY_LABEL = {label: mode for label, mode in CAPTURE_MODES}
-LABEL_BY_MODE = {mode: label for label, mode in CAPTURE_MODES}
+SETTING_BY_LABEL = {label: setting for label, setting in CAPTURE_MODES}
+
+
+def _label_for_setting(mode, on_demand):
+    """Map a (mode, on_demand) config pair to its picker label. OBS ignores
+    on_demand; unknown combos fall back to the first (continuous) option."""
+    if mode == "obs":
+        return CAPTURE_MODES[2][0]
+    for label, (m, od) in CAPTURE_MODES:
+        if m == mode and od == bool(on_demand):
+            return label
+    return CAPTURE_MODES[0][0]
 
 # Status state -> (dot color, human text)
 STATE_UI = {
@@ -62,6 +74,7 @@ class App:
         self._stop = None
         self._latest = {"state": "idle", "event": "tick"}
         self._update_result = _UNSET  # set by the update-check thread (may be None)
+        self._dirty = False  # unsaved settings changes
 
         root.title(f"Apex Tracker  v{core.__version__}")
         root.geometry("460x640")
@@ -111,6 +124,8 @@ class App:
         self.stop_btn = ttk.Button(ctrl, text="Stop", command=self.stop)
         self.stop_btn.pack(side="left", padx=6)
         ttk.Button(ctrl, text="Open CSV", command=self.open_csv).pack(side="left")
+        self.shot_btn = ttk.Button(ctrl, text="Capture frame", command=self.capture_frame)
+        self.shot_btn.pack(side="left", padx=6)
         ttk.Button(ctrl, text="Dashboard", command=self.open_dashboard).pack(side="right")
 
         # Settings
@@ -147,34 +162,41 @@ class App:
         self.res_combo = ttk.Combobox(resf, textvariable=self.res_var, values=values,
                                       state="readonly", width=16)
         self.res_combo.pack(side="left", padx=6)
+        self.res_combo.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
 
-        # Capture mode picker (standalone vs OBS Virtual Camera).
+        # Capture mode picker (continuous / on-demand / OBS).
         capf = ttk.Frame(sett)
         capf.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(capf, text="Capture mode:").pack(side="left")
-        cur_mode = (self.cfg.get("capture") or {}).get("mode", "monitor")
-        self.mode_var = tk.StringVar(value=LABEL_BY_MODE.get(cur_mode, CAPTURE_MODES[0][0]))
+        cap_cfg = self.cfg.get("capture") or {}
+        self.mode_var = tk.StringVar(
+            value=_label_for_setting(cap_cfg.get("mode", "monitor"),
+                                     cap_cfg.get("on_demand", False)))
         self.mode_combo = ttk.Combobox(capf, textvariable=self.mode_var,
                                        values=[lbl for lbl, _ in CAPTURE_MODES],
-                                       state="readonly", width=32)
+                                       state="readonly", width=40)
         self.mode_combo.pack(side="left", padx=6)
-        self.mode_combo.bind("<<ComboboxSelected>>", self._on_capture_mode_change)
+        self.mode_combo.bind("<<ComboboxSelected>>",
+                             lambda e: (self._on_capture_mode_change(), self._mark_dirty()))
         self.mode_note = ttk.Label(sett, text="", foreground="#555", wraplength=400,
                                    justify="left")
         self.mode_note.pack(anchor="w", padx=8)
-        self._on_capture_mode_change()  # set the initial hint
+        self._on_capture_mode_change()  # set the initial hint (not a user change)
 
         dashf = ttk.Frame(sett)
         dashf.pack(fill="x", padx=8, pady=2)
         ttk.Label(dashf, text="Dashboard URL:").pack(side="left")
         self.dash_var = tk.StringVar(value=self.cfg.get("dashboard_url", ""))
-        ttk.Entry(dashf, textvariable=self.dash_var).pack(side="left", fill="x",
-                                                          expand=True, padx=6)
+        dash_entry = ttk.Entry(dashf, textvariable=self.dash_var)
+        dash_entry.pack(side="left", fill="x", expand=True, padx=6)
+        dash_entry.bind("<KeyRelease>", lambda e: self._mark_dirty())
 
         savef = ttk.Frame(sett)
         savef.pack(fill="x", padx=8, pady=(6, 8))
-        ttk.Button(savef, text="Save settings", command=self.save_settings).pack(side="left")
-        self.save_note = ttk.Label(savef, text="", foreground="#2ea043")
+        self.save_btn = ttk.Button(savef, text="Save settings", command=self.save_settings)
+        self.save_btn.pack(side="left")
+        self.save_note = ttk.Label(savef, text="Settings are applied on Start.",
+                                   foreground="#888")
         self.save_note.pack(side="left", padx=8)
 
         # Footer: update check
@@ -187,22 +209,34 @@ class App:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # --------------------------------------------------------- unsaved state
+    def _mark_dirty(self):
+        """Flag that a setting changed but isn't saved yet, and make that obvious:
+        a red note + an asterisk on the Save button. Cleared by save_settings."""
+        self._dirty = True
+        self.save_btn.config(text="Save settings *")
+        self.save_note.config(text="Unsaved - click Save settings to apply",
+                              foreground="#d1242f")
+
     # ------------------------------------------------------------- roster ops
     def _roster_add(self):
         name = self.add_entry.get().strip()
         if name and name not in self.roster.get(0, "end"):
             self.roster.insert("end", name)
+            self._mark_dirty()
         self.add_entry.delete(0, "end")
 
     def _roster_remove(self):
+        if self.roster.curselection():
+            self._mark_dirty()
         for i in reversed(self.roster.curselection()):
             self.roster.delete(i)
 
     # --------------------------------------------------------- capture mode
     def _on_capture_mode_change(self, *_):
-        """Update the hint under the picker and, for OBS mode, check live whether
-        the OBS Virtual Camera is actually present right now."""
-        mode = MODE_BY_LABEL.get(self.mode_var.get(), "monitor")
+        """Update the hint under the picker; for OBS mode, check live whether the
+        OBS Virtual Camera is actually present right now."""
+        mode, on_demand = SETTING_BY_LABEL.get(self.mode_var.get(), ("monitor", False))
         if mode == "obs":
             name = (self.cfg.get("capture") or {}).get("video_device_name", "OBS Virtual")
             try:
@@ -219,10 +253,16 @@ class App:
                     text=f"OBS Virtual Camera detected (device {idx}). Zero game "
                          f"overhead while OBS is running.",
                     foreground="#2ea043")
+        elif on_demand:
+            self.mode_note.config(
+                text="BETA: captures in bursts to reduce fullscreen stutter, but can "
+                     "MISS a match's end screen and not log it. Use OBS for stutter-free "
+                     "+ reliable.",
+                foreground="#b5860b")
         else:
             self.mode_note.config(
-                text="Standalone - no OBS needed. Expect a brief blip every ~12s "
-                     "(exclusive fullscreen).",
+                text="Reliable default. Captures continuously; may cause some stutter in "
+                     "exclusive fullscreen (use Borderless or OBS to avoid it).",
                 foreground="#555")
 
     # ------------------------------------------------------------- watcher
@@ -233,6 +273,17 @@ class App:
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        # Catch the easy-to-miss case: changed a setting (resolution / capture mode)
+        # but never clicked Save, so it wouldn't take effect this run.
+        if self._dirty:
+            ans = messagebox.askyesnocancel(
+                "Unsaved settings",
+                "You changed settings but haven't saved them, so they won't apply.\n\n"
+                "Save them now and start?")
+            if ans is None:        # Cancel - don't start
+                return
+            if ans:                # Yes - save first
+                self.save_settings()
         self.cfg = core.load_config()  # pick up any saved settings
         self._stop = threading.Event()
         forced = self.cfg.get("force_resolution") or None
@@ -298,13 +349,20 @@ class App:
         sel = self.res_var.get()
         self.cfg["force_resolution"] = "" if sel == AUTO_LABEL else sel
         self.cfg["dashboard_url"] = self.dash_var.get().strip()
-        self.cfg.setdefault("capture", {})["mode"] = MODE_BY_LABEL.get(
-            self.mode_var.get(), "monitor")
+        mode, on_demand = SETTING_BY_LABEL.get(self.mode_var.get(), ("monitor", False))
+        cap = self.cfg.setdefault("capture", {})
+        cap["mode"] = mode
+        cap["on_demand"] = on_demand
         core.save_config(self.cfg)
+        self._dirty = False
+        self.save_btn.config(text="Save settings")
         running = bool(self._thread and self._thread.is_alive())
         self.save_note.config(
-            text="Saved. Restart the watcher to apply." if running else "Saved.")
-        self.root.after(4000, lambda: self.save_note.config(text=""))
+            text="Saved - Stop then Start to apply." if running else "Saved.",
+            foreground="#2ea043")
+        self.root.after(5000, lambda: (
+            self.save_note.config(text="Settings are applied on Start.",
+                                  foreground="#888") if not self._dirty else None))
 
     # ------------------------------------------------------------- actions
     def open_csv(self):
@@ -314,6 +372,57 @@ class App:
         else:
             messagebox.showinfo("No CSV yet",
                                 "No matches have been logged yet, so there's no CSV.")
+
+    def capture_frame(self):
+        """Grab one frame via the current capture mode and save it to debug/, so the
+        user can send it for calibration/diagnostics without using the console.
+        Runs off the UI thread (capture can take a few seconds)."""
+        self.shot_btn.config(state="disabled")
+        self.save_note.config(text="Capturing a frame...", foreground="#555")
+        cfg = core.load_config()
+
+        def worker():
+            res = {}
+            try:
+                cap, src, _ = core.open_live_capture(cfg)
+                ok = cap.wait_first(8)
+                frame = cap.grab() if ok else None
+                if frame is None:
+                    res["error"] = (f"No frame received from {src}.\n\n"
+                                    "Make sure Apex (or OBS, in OBS mode) is running "
+                                    "and visible on screen, then try again.")
+                else:
+                    import cv2 as _cv2
+                    os.makedirs(core.DEBUG_DIR, exist_ok=True)
+                    out = os.path.join(core.DEBUG_DIR, "capture_live.png")
+                    _cv2.imwrite(out, frame)
+                    res.update(path=out, w=frame.shape[1], h=frame.shape[0],
+                               mb=float(frame.mean()), src=src)
+                cap.release()
+            except Exception as e:
+                res["error"] = str(e)
+            self.root.after(0, lambda: self._capture_frame_done(res))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _capture_frame_done(self, res):
+        self.shot_btn.config(state="normal")
+        self.save_note.config(text="")
+        if res.get("error"):
+            messagebox.showerror("Capture failed", res["error"])
+            return
+        black = res["mb"] < 2.0
+        msg = (f"Saved a {res['w']}x{res['h']} frame from {res['src']} "
+               f"(brightness {res['mb']:.0f}).\n\n")
+        if black:
+            msg += ("WARNING: the frame looks BLACK - the capture was blocked or the "
+                    "source isn't visible. Bring Apex/OBS on screen and try again.\n\n")
+        msg += f"File:\n{res['path']}\n\nOpen the debug folder to grab it?"
+        if messagebox.askyesno("Frame captured", msg):
+            try:
+                os.startfile(os.path.dirname(res["path"]))
+            except Exception:
+                pass
 
     def open_dashboard(self):
         url = self.dash_var.get().strip() or self.cfg.get("dashboard_url", "")
