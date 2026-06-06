@@ -34,6 +34,15 @@ for pkg in (
 # httpx/websockets are pulled by supabase but occasionally missed.
 hiddenimports += ["httpx", "websockets", "h2", "anyio"]
 
+# pygrabber + comtypes power OBS-mode device auto-detection (find the OBS Virtual
+# Camera by name). comtypes generates wrapper modules at runtime, so collect it
+# fully or the frozen build can't enumerate video devices.
+for pkg in ("pygrabber", "comtypes"):
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
+
 # The OCR path is pure onnxruntime - none of the heavy ML / data stacks that happen
 # to be installed in this env are needed. Excluding them keeps the build a few
 # hundred MB instead of ~5 GB.

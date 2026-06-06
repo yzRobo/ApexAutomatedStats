@@ -9,6 +9,7 @@ the Apex process, never reads game memory, and never sends input to the game.
 Usage:
     py apex_tracker.py shot                 # save one capture to debug/ (prove capture works)
     py apex_tracker.py monitors             # list detected monitors
+    py apex_tracker.py devices              # list video input devices (find the OBS Virtual Camera)
     py apex_tracker.py setup                # ask your resolution + save it to config.json
     py apex_tracker.py calibrate [img.png]  # draw crop boxes + OCR them (uses a PNG, or live screen)
     py apex_tracker.py watch                # run the live auto-watcher
@@ -49,7 +50,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -511,6 +512,86 @@ class WGCCapture:
             pass
 
 
+def find_video_device_index(name_hint="OBS Virtual"):
+    """Return the index of the first video input device whose name contains
+    name_hint (default the OBS Virtual Camera), or None. Uses pygrabber's
+    DirectShow enumeration; returns None if pygrabber isn't available or the
+    device isn't present (e.g. OBS isn't running with Virtual Camera started)."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        names = FilterGraph().get_input_devices()
+    except Exception:
+        return None
+    hint = name_hint.lower()
+    for i, n in enumerate(names):
+        if hint in (n or "").lower():
+            return i
+    return None
+
+
+class VideoDeviceCapture:
+    """Reads a DirectShow video device (e.g. the OBS Virtual Camera) on a
+    background thread, exposing the same grab()/last_frame_age()/wait_first()/
+    release() interface as WGCCapture.
+
+    This is the ZERO game-overhead path: OBS captures Apex with its own Game
+    Capture hook (smooth, already running) and outputs the frames as a virtual
+    camera; we just read that camera. We never touch the game, so it stays
+    passive and anti-cheat-safe, and the game keeps full exclusive-fullscreen
+    performance because nothing here captures the screen."""
+
+    def __init__(self, index, width=1920, height=1080, read_interval=0.05):
+        self._lock = threading.Lock()
+        self._latest = None
+        self._last_ts = 0.0
+        self._stop = threading.Event()
+        self._read_interval = read_interval
+        # CAP_DSHOW is the reliable backend for the OBS virtual cam on Windows.
+        self._cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        try:
+            # Request the OBS canvas resolution. Without this, DirectShow defaults
+            # to 640x480 - far too small (and 4:3) for the summary-screen OCR.
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                with self._lock:
+                    self._latest = frame
+                    self._last_ts = time.time()
+            else:
+                time.sleep(0.1)  # device not delivering yet; back off
+            self._stop.wait(self._read_interval)
+
+    def grab(self):
+        with self._lock:
+            return None if self._latest is None else self._latest.copy()
+
+    def last_frame_age(self):
+        with self._lock:
+            return time.time() - self._last_ts if self._last_ts else 1e9
+
+    def wait_first(self, timeout=5.0):
+        t0 = time.time()
+        while self.grab() is None and time.time() - t0 < timeout:
+            time.sleep(0.05)
+        return self.grab() is not None
+
+    def release(self):
+        self._stop.set()
+        try:
+            self._cap.release()
+        except Exception:
+            pass
+
+
 def enumerate_monitors():
     """Best-effort monitor list for the 'monitors' command, via dxcam."""
     try:
@@ -693,6 +774,9 @@ def open_live_capture(cfg):
     smooth path for exclusive-fullscreen games (what OBS display capture uses).
     mode "window": capture just the Apex window (works on any monitor but can make
     a fullscreen game stutter).
+    mode "obs": read the OBS Virtual Camera instead of capturing the screen at all
+    (zero game overhead - OBS already has the frames). Requires OBS running with a
+    Game Capture of Apex and Virtual Camera started.
 
     Returns (capture, description, hwnd). hwnd is the tracked Apex window (or None).
     """
@@ -701,6 +785,20 @@ def open_live_capture(cfg):
     throttle = cap_cfg.get("throttle_ms", 500)
     mode = cap_cfg.get("mode", "monitor")
     hwnd = find_window_hwnd(exe_names)
+
+    if mode == "obs":
+        # Read OBS's Virtual Camera. No screen capture, so the game keeps full
+        # exclusive-fullscreen performance and there is no stutter from us at all.
+        idx = cap_cfg.get("video_device_index", -1)
+        if idx is None or idx < 0:
+            idx = find_video_device_index(cap_cfg.get("video_device_name", "OBS Virtual"))
+        vw = cap_cfg.get("video_width", 1920)
+        vh = cap_cfg.get("video_height", 1080)
+        if idx is None:
+            # Device not found - surface it clearly instead of silently capturing
+            # nothing. The watch loop will report "waiting" and the debug log says why.
+            return VideoDeviceCapture(-1, vw, vh), "OBS Virtual Camera (NOT FOUND - is OBS running with Virtual Camera started?)", hwnd
+        return VideoDeviceCapture(idx, vw, vh), f"OBS Virtual Camera (device {idx})", hwnd
 
     if mode == "window" and hwnd:
         return WGCCapture(hwnd=hwnd, throttle_ms=throttle), "Apex window", hwnd
@@ -723,6 +821,26 @@ def cmd_monitors():
         print(f"  {o['index']} : {o['size'][0]}x{o['size'][1]}")
     apex = find_window_hwnd(["r5apex_dx12.exe", "r5apex.exe"])
     print(f"\nApex window: {'found (hwnd %d)' % apex if apex else 'NOT running'}")
+
+
+def cmd_devices():
+    """List DirectShow video input devices (for picking video_device_index in OBS
+    mode). The OBS Virtual Camera only appears once OBS has started it."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        names = FilterGraph().get_input_devices()
+    except Exception as e:
+        print(f"Could not enumerate video devices ({e}).")
+        print("Install pygrabber:  py -m pip install pygrabber")
+        return
+    print("Video input devices (index : name):")
+    for i, n in enumerate(names):
+        marker = "  <-- OBS Virtual Camera" if "obs virtual" in (n or "").lower() else ""
+        # Encode-safe print: device names can contain characters the console can't show.
+        safe = (n or "").encode("ascii", "replace").decode("ascii")
+        print(f"  {i} : {safe}{marker}")
+    if not any("obs virtual" in (n or "").lower() for n in names):
+        print("\nOBS Virtual Camera not listed. In OBS click 'Start Virtual Camera', then re-run.")
 
 
 def cmd_batch(arg, forced_res=None):
@@ -770,21 +888,34 @@ def cmd_batch(arg, forced_res=None):
     print(f"\nWrote {out}")
 
 
-def cmd_shot():
+def cmd_shot(mode_override=None):
+    """Grab one frame through the live capture path and save it to debug/, so you
+    can SEE what the tracker sees and confirm the feed isn't black/frozen. Pass
+    mode_override (e.g. 'obs') to test a specific capture mode without editing
+    config - handy for verifying the OBS Virtual Camera feed."""
     cfg = load_config()
+    if mode_override:
+        cfg.setdefault("capture", {})["mode"] = mode_override
     os.makedirs(DEBUG_DIR, exist_ok=True)
     cap, src, _ = open_live_capture(cfg)
     print(f"Capturing {src} ...")
     if not cap.wait_first(8):
-        print("No frame received. Is Apex running and visible?")
+        print("No frame received.")
+        if (cfg.get("capture") or {}).get("mode") == "obs":
+            print("  OBS mode: is OBS running with a Game Capture source AND "
+                  "'Start Virtual Camera' clicked? Run 'devices' to confirm the camera exists.")
+        else:
+            print("  Is Apex running and visible?")
         cap.release()
         return
     frame = cap.grab()
     out = os.path.join(DEBUG_DIR, "capture_live.png")
     cv2.imwrite(out, frame)
-    black = float(frame.mean()) < 2.0
-    print(f"saved {out}  {frame.shape[1]}x{frame.shape[0]}  mean_brightness={frame.mean():.1f}"
-          + ("  <-- LOOKS BLACK (capture blocked)" if black else "  (looks good)"))
+    mb = float(frame.mean())
+    black = mb < 2.0
+    note = ("  <-- LOOKS BLACK (feed blocked / OBS scene empty)" if black
+            else "  (looks good - open the PNG to confirm it shows your game)")
+    print(f"saved {out}  {frame.shape[1]}x{frame.shape[0]}  mean_brightness={mb:.1f}{note}")
     cap.release()
 
 
@@ -843,6 +974,47 @@ def cmd_calibrate(arg, forced_res=None):
               f"dmg={p['damage']} rev={p['revive_given']} resp={p['respawn_given']}")
 
 
+def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb):
+    """Read a settled summary frame and log it if it's new and fully rendered.
+    Returns 'incomplete' (still animating - try again), 'duplicate' (already
+    logged), or 'logged'. Shared by the persistent and on-demand watch loops so
+    the dedup logic lives in exactly one place."""
+    match = extract_match(frame, cfg_eff, scale)
+    # Wait until every player is named AND placement has rendered, so we never
+    # log a half-drawn screen (the cause of the earlier blank rows).
+    if any(not p["name"] for p in match["players"]) or match["squad_placed"] is None:
+        return "incomplete"
+    if not match["session_id"]:
+        match["session_id"] = match_key(match)  # persist so restarts dedup
+    # Dedup on the stable stats, not the flaky session id. Skip if this match was
+    # already logged - even if its id OCRs differently this time.
+    sk = sid_norm(match["session_id"])
+    fp = stat_fingerprint(match["players"], match["squad_placed"],
+                          match["total_squad_kills"])
+    if fp in seen or (sk and sk in seen):
+        return "duplicate"
+    append_match(path, match)
+    seen.add(fp)
+    if sk:
+        seen.add(sk)
+    status["logged_this_run"] += 1
+    status["last_match"] = {
+        "session_id": match["session_id"],
+        "placed": match["squad_placed"],
+        "total_kills": match["total_squad_kills"],
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "players": [{"name": p["name"], "kills": p["kills"],
+                     "damage": p["damage"]} for p in match["players"]],
+    }
+    emit("log")
+    if log_cb:
+        try:
+            log_cb(dict(status["last_match"]))
+        except Exception:
+            pass
+    return "logged"
+
+
 def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None):
     """Core watch loop, shared by the console (cmd_watch) and the GUI.
 
@@ -861,6 +1033,10 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     path = csv_path(cfg)
     seen = already_logged_ids(path)
     poll = cfg.get("poll_seconds", 1.0)
+    # A frame is only "stale" once it's older than the capture interval plus a
+    # margin; otherwise a high throttle_ms (the stutter fix) trips false warnings.
+    throttle_s = cfg.get("capture", {}).get("throttle_ms", 1000) / 1000.0
+    stale_after = max(5.0, throttle_s + 3.0)
     if cfg.get("low_priority", True):
         set_below_normal_priority()
 
@@ -879,26 +1055,43 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                 pass
 
     emit("start")
+
+    # On-demand mode: keep NO capture session open during gameplay, so an
+    # exclusive-fullscreen game keeps its fast present path (no constant stutter).
+    # Briefly open capture to probe for the end screen, then close it again.
+    # (Not used for OBS mode: reading the virtual camera has zero game overhead,
+    # so there is nothing to avoid - the continuous loop below is better there.)
+    cap_mode = cfg.get("capture", {}).get("mode", "monitor")
+    if cap_mode != "obs" and cfg.get("capture", {}).get("on_demand", False):
+        return _watch_on_demand(cfg, forced, path, seen, poll,
+                                settle_seconds=cfg.get("settle_seconds", 1.5),
+                                hb_secs=cfg.get("heartbeat_seconds", 60),
+                                status=status, emit=emit, log_cb=log_cb,
+                                stop_event=stop_event)
+
+    dbg = _make_debug_logger(cfg)
+    dbg(f"continuous watch started; mode={cap_mode} poll={poll}s csv={path}")
     cap, src, hwnd = open_live_capture(cfg)
     status["src"] = src
     got = cap.wait_first(8)
     status["state"] = "watching" if got else "waiting"
+    dbg(f"opened {src}; first frame: {'OK' if got else 'NONE within 8s'}")
     emit("tick")
 
     last_recheck = time.time()
     hb_secs = cfg.get("heartbeat_seconds", 60)
     last_hb = time.time()
-    logged_this_run = 0
     summary_handled = False
     banner_since = None
     absent_since = None
     announced = False
+    banner_logged = False
     settle = cfg.get("settle_seconds", 1.5)
     try:
         while not stop_event.is_set():
             age = cap.last_frame_age()
             status["frame_age"] = age
-            status["state"] = "watching" if age < 5 else "stale"
+            status["state"] = "watching" if age < stale_after else "stale"
             # Cheaply re-acquire only when needed. During normal play this is just
             # an IsWindow() check (no expensive window scan), so it won't hitch.
             if time.time() - last_recheck > 30:
@@ -908,6 +1101,7 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                     cap.release()
                     cap, src, hwnd = open_live_capture(cfg)
                     status["src"] = src
+                    dbg(f"re-acquired capture -> {src}")
                     emit("reacquire")
             # Heartbeat tick so a front-end can show it is alive and capturing.
             if hb_secs and time.time() - last_hb >= hb_secs:
@@ -928,6 +1122,7 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                 status["resolution"] = f"{w}x{h}"
                 status["profile"] = prof_key
                 emit("announce")
+                dbg(f"resolution {w}x{h}, profile={prof_key or '(scaled base)'}")
 
             # Cheap OCR-free gate every poll. OCR + extraction only happen once per
             # summary, after it has been on screen long enough to finish rendering.
@@ -938,13 +1133,19 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                 # seconds. A brief 1-frame colour flicker on the same summary must not
                 # reset summary_handled, or the match gets read and logged twice.
                 if time.time() - absent_since >= 3.0:
+                    if banner_logged:
+                        dbg("banner gone; re-armed for next summary")
                     summary_handled = False
                     banner_since = None
+                    banner_logged = False
                 stop_event.wait(poll)
                 continue
             absent_since = None
             if banner_since is None:
                 banner_since = time.time()
+            if not banner_logged:
+                banner_logged = True
+                dbg("BANNER COLOUR seen; settling before read")
             if summary_handled:
                 stop_event.wait(poll)
                 continue
@@ -956,49 +1157,149 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                 stop_event.wait(poll)   # banner colour but not a summary banner
                 continue
 
-            match = extract_match(frame, cfg_eff, scale)
-            # Wait until every player is named AND placement has rendered, so we
-            # never log a half-drawn screen (the cause of the earlier blank rows).
-            if any(not p["name"] for p in match["players"]) or match["squad_placed"] is None:
-                stop_event.wait(poll)   # still animating in; retry next poll
-                continue
-            summary_handled = True  # this summary instance is now processed
-            if not match["session_id"]:
-                match["session_id"] = match_key(match)  # persist so restarts dedup
-            # Dedup on the stable stats, not the flaky session id. Skip if this match
-            # was already logged - even if its id OCRs differently this time.
-            sk = sid_norm(match["session_id"])
-            fp = stat_fingerprint(match["players"], match["squad_placed"],
-                                  match["total_squad_kills"])
-            if fp in seen or (sk and sk in seen):
-                stop_event.wait(poll)
-                continue
-            append_match(path, match)
-            seen.add(fp)
-            if sk:
-                seen.add(sk)
-            logged_this_run += 1
-            status["logged_this_run"] = logged_this_run
-            status["last_match"] = {
-                "session_id": match["session_id"],
-                "placed": match["squad_placed"],
-                "total_kills": match["total_squad_kills"],
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "players": [{"name": p["name"], "kills": p["kills"],
-                             "damage": p["damage"]} for p in match["players"]],
-            }
-            emit("log")
-            if log_cb:
-                try:
-                    log_cb(dict(status["last_match"]))
-                except Exception:
-                    pass
+            result = _try_log_match(frame, cfg_eff, scale, path, seen,
+                                    status, emit, log_cb)
+            if result != "incomplete":
+                summary_handled = True  # this summary instance is now processed
+                dbg(f"read result: {result}"
+                    + (f" (now {status['logged_this_run']} logged this run)"
+                       if result == "logged" else ""))
             stop_event.wait(poll)
     finally:
         cap.release()
+        dbg("continuous watch stopped")
         status["state"] = "stopped"
         emit("stop")
-    return logged_this_run
+    return status["logged_this_run"]
+
+
+def _make_debug_logger(cfg):
+    """Return a dbg(msg) that appends timestamped lines to debug/tracker_debug.log
+    when capture.debug_log is true, else a no-op. Lets you alt-tab out after a
+    session and see exactly when the tracker opened capture, what it saw, and when
+    it idled - so you can line probes up against any in-game stutter you felt."""
+    if not cfg.get("capture", {}).get("debug_log", False):
+        return lambda msg: None
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    log_path = os.path.join(DEBUG_DIR, "tracker_debug.log")
+
+    def dbg(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now():%H:%M:%S.%f}"[:-3] + f"] {msg}\n")
+        except Exception:
+            pass
+
+    dbg(f"--- session start {datetime.now():%Y-%m-%d %H:%M:%S} ---")
+    return dbg
+
+
+def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
+                     status, emit, log_cb, stop_event):
+    """Capture only in short bursts so an exclusive-fullscreen game keeps its fast
+    present path during gameplay (eliminates the constant WGC capture stutter).
+
+    Idle loop: open capture, grab ONE frame, close it, check for the end-screen
+    banner colour, then sleep `idle_probe_seconds`. No session stays open while you
+    play. When a banner is spotted, hold that one session open and read at the
+    normal poll cadence until the screen settles enough to log (you're on the
+    summary by then, so a brief active capture is fine), then close and idle again.
+    """
+    idle_probe = cfg.get("capture", {}).get("idle_probe_seconds", 8)
+    dbg = _make_debug_logger(cfg)
+    dbg(f"on-demand watch started; idle_probe={idle_probe}s settle={settle_seconds}s "
+        f"poll={poll}s csv={path}")
+    announced = False
+    last_hb = time.time()
+
+    def heartbeat_or_tick():
+        nonlocal last_hb
+        if hb_secs and time.time() - last_hb >= hb_secs:
+            last_hb = time.time()
+            emit("heartbeat")
+        else:
+            emit("tick")
+
+    probe_n = 0
+    while not stop_event.is_set():
+        probe_n += 1
+        t_open = time.time()
+        cap, src, hwnd = open_live_capture(cfg)
+        status["src"] = src
+        got = cap.wait_first(5)
+        frame = cap.grab() if got else None
+        open_ms = (time.time() - t_open) * 1000
+        if frame is None:
+            cap.release()
+            status["state"] = "waiting"
+            status["frame_age"] = None
+            dbg(f"probe #{probe_n}: NO FRAME from {src} after {open_ms:.0f}ms "
+                f"(Apex visible?); released, idling {idle_probe}s")
+            heartbeat_or_tick()
+            stop_event.wait(idle_probe)
+            continue
+
+        h, w = frame.shape[:2]
+        cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
+        scale = scaler(cfg_eff, w, h)
+        if not announced:
+            announced = True
+            status["resolution"] = f"{w}x{h}"
+            status["profile"] = prof_key
+            emit("announce")
+            dbg(f"resolution {w}x{h}, profile={prof_key or '(scaled base)'}")
+        status["state"] = "watching"
+        status["frame_age"] = cap.last_frame_age()
+
+        if not banner_color_present(frame, cfg_eff, scale):
+            # No end screen - drop the session immediately. This is the clean,
+            # zero-capture gameplay window where the game runs stutter-free.
+            cap.release()
+            dbg(f"probe #{probe_n}: {src} {w}x{h}, open+grab {open_ms:.0f}ms, "
+                f"no banner -> released, idling {idle_probe}s (capture OFF)")
+            heartbeat_or_tick()
+            stop_event.wait(idle_probe)
+            continue
+
+        # Possible end screen: keep THIS session open and read at the normal
+        # cadence until it settles and we can log it.
+        dbg(f"probe #{probe_n}: BANNER COLOUR seen -> holding session open to read")
+        banner_since = time.time()
+        while not stop_event.is_set():
+            frame = cap.grab()
+            if frame is None:
+                stop_event.wait(poll)
+                continue
+            status["frame_age"] = cap.last_frame_age()
+            if not banner_color_present(frame, cfg_eff, scale):
+                dbg("  banner gone before read completed; back to idle")
+                break  # banner gone before we could read it; back to idle probing
+            if time.time() - banner_since < settle_seconds:
+                stop_event.wait(poll)
+                continue
+            if not banner_text_present(frame, cfg_eff, scale):
+                dbg("  banner colour but text not a summary; retrying")
+                stop_event.wait(poll)   # banner colour but not a summary banner
+                continue
+            result = _try_log_match(frame, cfg_eff, scale, path, seen,
+                                    status, emit, log_cb)
+            dbg(f"  read result: {result}"
+                + (f" (now {status['logged_this_run']} logged this run)"
+                   if result == "logged" else ""))
+            if result != "incomplete":
+                break   # logged or already-seen; stop reading this summary
+            stop_event.wait(poll)     # still animating in; retry
+        cap.release()
+        dbg(f"probe #{probe_n}: released after summary read, idling {idle_probe}s (capture OFF)")
+        # Idle again. If we just logged, this also waits out part of the summary
+        # so the next probe doesn't immediately re-read the same (now deduped)
+        # screen more than necessary.
+        stop_event.wait(idle_probe)
+
+    dbg("on-demand watch stopped")
+    status["state"] = "stopped"
+    emit("stop")
+    return status["logged_this_run"]
 
 
 def cmd_watch(forced_res=None):
@@ -1093,10 +1394,12 @@ def main():
     pos = args[1] if len(args) > 1 else None
     if cmd == "monitors":
         cmd_monitors()
+    elif cmd == "devices":
+        cmd_devices()
     elif cmd == "batch":
         cmd_batch(pos, forced_res)
     elif cmd == "shot":
-        cmd_shot()
+        cmd_shot(pos)   # optional mode override, e.g. "shot obs"
     elif cmd == "calibrate":
         cmd_calibrate(pos, forced_res)
     elif cmd == "setup":

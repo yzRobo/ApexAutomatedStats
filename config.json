@@ -2,7 +2,8 @@
   "_comment": "All pixel coordinates are based on a 1920x1080 capture. If your capture resolution differs, set base_width/base_height to match how these were measured (1920x1080) and the tool scales automatically. Tune regions with calibrate mode.",
   "base_width": 1920,
   "base_height": 1080,
-  "_capture_help": "Live capture uses Windows Graphics Capture (like OBS). mode 'monitor' (default) captures the whole monitor Apex is on (auto-detected from the Apex window) - this is the smooth path for fullscreen games. mode 'window' captures just the Apex window (works anywhere but can make a fullscreen game stutter). monitor_index is the fallback monitor if Apex isn't found. throttle_ms caps frame delivery (higher = lighter).",
+  "_capture_help": "Live capture. mode 'obs' = read the OBS Virtual Camera instead of capturing the screen (ZERO game overhead, no stutter, keeps exclusive fullscreen - requires OBS running with a Game Capture of Apex and Virtual Camera started; see OBS setup below). mode 'monitor' = Windows Graphics Capture of the whole monitor Apex is on (works without OBS but an exclusive-fullscreen game stutters while capturing). mode 'window' = WGC of just the Apex window. monitor_index is the fallback monitor for WGC modes if Apex isn't found. throttle_ms caps how often WGC grabs a frame (WGC modes only).",
+  "_obs_setup_help": "For mode 'obs': in OBS add a Source -> Game Capture -> capture Apex (mode 'Capture specific window' = r5apex), then click 'Start Virtual Camera' in OBS Controls. The tracker auto-finds the device by name (video_device_name). If auto-detect picks the wrong camera, set video_device_index to the device's index (run 'py apex_tracker.py devices' to list them). The OBS scene must show the full end screen un-cropped and with no overlays covering the player cards / placement / kills / bottom-left id.",
   "capture": {
     "mode": "monitor",
     "exe_names": [
@@ -10,7 +11,17 @@
       "r5apex.exe"
     ],
     "monitor_index": 1,
-    "throttle_ms": 1000
+    "throttle_ms": 4000,
+    "video_device_name": "OBS Virtual",
+    "video_device_index": -1,
+    "_video_res_help": "Resolution to request from the OBS Virtual Camera (mode 'obs'). Match your OBS Output (Scaled) Resolution - Settings > Video. Without this the camera defaults to 640x480, too small for the OCR. Use 1920x1080 (default) or 2560x1440 etc.",
+    "video_width": 1920,
+    "video_height": 1080,
+    "_on_demand_help": "true = capture only in short bursts: open capture, grab one frame to check for the end screen, close it, then idle. No capture session stays open while you play, so an EXCLUSIVE-FULLSCREEN game keeps its fast present path and stops the constant micro-stutter. Tradeoff: a brief hitch each time it probes (every idle_probe_seconds). The end screen stays up ~30s, so you can raise idle_probe_seconds to 10-15 to probe less often if you still feel it.",
+    "on_demand": true,
+    "idle_probe_seconds": 12,
+    "_debug_log_help": "true = append timestamped lines to debug/tracker_debug.log for every capture probe (when it opens capture, what it saw, when it idled). Use it to line probes up against any stutter you felt in-game. Set false once tuned.",
+    "debug_log": false
   },
   "_low_priority_help": "Run the tracker at below-normal process priority so Windows favors Apex. Recommended true.",
   "low_priority": true,

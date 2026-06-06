@@ -8,6 +8,10 @@ rapidocr-onnxruntime==1.4.4
 windows-capture==2.0.0
 supabase==2.31.0
 python-dotenv==1.0.0
+# OBS Virtual Camera mode: name-based detection of the OBS camera (capture.mode
+# 'obs'). Optional - without it, OBS mode still works if you set video_device_index
+# manually; auto-detect just falls back to None.
+pygrabber==0.2
 
 # Build-only (not needed at runtime):
 pyinstaller==6.11.1

@@ -66,10 +66,34 @@ Leave it running while you play. Each new match's summary is logged automaticall
   tile-and-vote for lone revive/respawn digits; names snapped to known squadmates.
 - If Apex restarts or its window changes, the watcher re-acquires it automatically.
 
+## Capture modes (performance / stutter)
+Capturing an **exclusive-fullscreen** game has an unavoidable cost: Windows has to
+pull the game off its fast present path to let anything outside the game see its
+pixels, which can cause micro-stutter. Pick the mode that suits you in the GUI's
+**Capture mode** dropdown (or `capture.mode` in `config.json`):
+
+- **Standalone — no OBS (default).** Captures in short on-demand bursts: it briefly
+  checks for the end screen, then closes capture and idles, so nothing is capturing
+  while you actually play. Removes the constant micro-stutter; you may notice a brief
+  blip every ~12s when it probes. Tune with `capture.idle_probe_seconds` (raise it to
+  probe less often — the end screen stays up ~30s so it's still caught).
+- **OBS Virtual Camera — zero game overhead.** Reads frames from OBS instead of
+  capturing the screen. If you already run OBS with a **Game Capture** of Apex, the
+  tracker piggybacks on the frames OBS already has — no extra load on the game, no
+  stutter, and you keep exclusive fullscreen. Still fully passive: we never touch the
+  game; OBS does the capture. **Setup:** in OBS add a Game Capture of Apex → click
+  **Start Virtual Camera** → choose "OBS Virtual Camera" in the tracker. Set
+  `capture.video_width/height` to your OBS canvas (default 1920x1080). Requires OBS
+  running. Run `ApexTracker.exe devices` to confirm the camera is detected.
+
+The other zero-stutter option is simply running Apex in **Borderless Windowed**.
+
 ## Commands
 ```
 py apex_tracker.py monitors             # list monitors
-py apex_tracker.py shot                 # save a capture of each monitor to debug/ (prove capture works)
+py apex_tracker.py devices              # list video inputs (find the OBS Virtual Camera)
+py apex_tracker.py shot                 # save a capture to debug/ (prove capture works)
+py apex_tracker.py shot obs             # save a capture via the OBS Virtual Camera (test OBS mode)
 py apex_tracker.py calibrate img.png    # draw crop boxes over a screenshot + OCR them
 py apex_tracker.py batch [folder|glob]  # OCR image(s) -> debug/sample_check.csv (verification)
 py apex_tracker.py watch                # run the live auto-watcher
@@ -84,9 +108,15 @@ kills, assists, knocks, damage, revive_given, respawn_given`
   `fp:...` fingerprint of names+damage is used instead (still unique per match).
 
 ## config.json — things you may want to tweak
+- `capture.mode`: `monitor` (Standalone, default) or `obs` (OBS Virtual Camera). See
+  **Capture modes** above.
+- `capture.on_demand`: `true` (default) = burst-capture so gameplay isn't continuously
+  captured (less fullscreen stutter). `capture.idle_probe_seconds` sets how often it probes.
+- `capture.video_device_name` / `video_device_index` / `video_width` / `video_height`:
+  OBS-mode settings (auto-detects the OBS camera by name; size should match your OBS canvas).
 - `capture.exe_names`: process names to auto-find (Apex is `r5apex_dx12.exe`).
 - `capture.monitor_index`: fallback monitor (1-based) used only if Apex isn't found.
-- `capture.throttle_ms`: min ms between captured frames (higher = lighter; 250 = ~4/s).
+- `capture.throttle_ms`: min ms between captured frames in WGC modes (higher = lighter).
 - `new_file_each_run`: `false` = one running file (default). `true` = a new
   timestamped file each time you start `watch` (e.g. `apex_matches_20260604_193512.csv`).
 - `known_names`: your recurring squadmates' gamertags — OCR names are snapped to

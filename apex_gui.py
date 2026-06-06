@@ -31,6 +31,16 @@ import apex_tracker as core
 COMMON_RES = ["1920x1080", "2560x1440", "3440x1440", "3840x2160"]
 AUTO_LABEL = "Auto-detect"
 
+# Capture-mode picker: (menu label, config capture.mode value). "monitor" runs the
+# on-demand WGC path (standalone, brief periodic blip); "obs" reads the OBS Virtual
+# Camera (zero game overhead but needs OBS running).
+CAPTURE_MODES = [
+    ("Standalone - no OBS (brief blip)", "monitor"),
+    ("OBS Virtual Camera - smooth (needs OBS)", "obs"),
+]
+MODE_BY_LABEL = {label: mode for label, mode in CAPTURE_MODES}
+LABEL_BY_MODE = {mode: label for label, mode in CAPTURE_MODES}
+
 # Status state -> (dot color, human text)
 STATE_UI = {
     "starting": ("#888888", "Starting..."),
@@ -54,8 +64,8 @@ class App:
         self._update_result = _UNSET  # set by the update-check thread (may be None)
 
         root.title(f"Apex Tracker  v{core.__version__}")
-        root.geometry("440x560")
-        root.minsize(420, 540)
+        root.geometry("460x640")
+        root.minsize(440, 600)
         self._build()
         self._set_running(False)
         self._refresh()  # start the 500ms UI poll
@@ -138,6 +148,22 @@ class App:
                                       state="readonly", width=16)
         self.res_combo.pack(side="left", padx=6)
 
+        # Capture mode picker (standalone vs OBS Virtual Camera).
+        capf = ttk.Frame(sett)
+        capf.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(capf, text="Capture mode:").pack(side="left")
+        cur_mode = (self.cfg.get("capture") or {}).get("mode", "monitor")
+        self.mode_var = tk.StringVar(value=LABEL_BY_MODE.get(cur_mode, CAPTURE_MODES[0][0]))
+        self.mode_combo = ttk.Combobox(capf, textvariable=self.mode_var,
+                                       values=[lbl for lbl, _ in CAPTURE_MODES],
+                                       state="readonly", width=32)
+        self.mode_combo.pack(side="left", padx=6)
+        self.mode_combo.bind("<<ComboboxSelected>>", self._on_capture_mode_change)
+        self.mode_note = ttk.Label(sett, text="", foreground="#555", wraplength=400,
+                                   justify="left")
+        self.mode_note.pack(anchor="w", padx=8)
+        self._on_capture_mode_change()  # set the initial hint
+
         dashf = ttk.Frame(sett)
         dashf.pack(fill="x", padx=8, pady=2)
         ttk.Label(dashf, text="Dashboard URL:").pack(side="left")
@@ -171,6 +197,33 @@ class App:
     def _roster_remove(self):
         for i in reversed(self.roster.curselection()):
             self.roster.delete(i)
+
+    # --------------------------------------------------------- capture mode
+    def _on_capture_mode_change(self, *_):
+        """Update the hint under the picker and, for OBS mode, check live whether
+        the OBS Virtual Camera is actually present right now."""
+        mode = MODE_BY_LABEL.get(self.mode_var.get(), "monitor")
+        if mode == "obs":
+            name = (self.cfg.get("capture") or {}).get("video_device_name", "OBS Virtual")
+            try:
+                idx = core.find_video_device_index(name)
+            except Exception:
+                idx = None
+            if idx is None:
+                self.mode_note.config(
+                    text="Needs OBS running with a Game Capture of Apex + "
+                         "'Start Virtual Camera'. Camera not detected right now.",
+                    foreground="#d1242f")
+            else:
+                self.mode_note.config(
+                    text=f"OBS Virtual Camera detected (device {idx}). Zero game "
+                         f"overhead while OBS is running.",
+                    foreground="#2ea043")
+        else:
+            self.mode_note.config(
+                text="Standalone - no OBS needed. Expect a brief blip every ~12s "
+                     "(exclusive fullscreen).",
+                foreground="#555")
 
     # ------------------------------------------------------------- watcher
     def _set_running(self, running):
@@ -245,6 +298,8 @@ class App:
         sel = self.res_var.get()
         self.cfg["force_resolution"] = "" if sel == AUTO_LABEL else sel
         self.cfg["dashboard_url"] = self.dash_var.get().strip()
+        self.cfg.setdefault("capture", {})["mode"] = MODE_BY_LABEL.get(
+            self.mode_var.get(), "monitor")
         core.save_config(self.cfg)
         running = bool(self._thread and self._thread.is_alive())
         self.save_note.config(
