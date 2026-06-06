@@ -41,6 +41,11 @@ Tuned for 1920x1080, and it **auto-scales to any 16:9 resolution** (1440p, 4K), 
 most setups just work. If your numbers look off, run `ApexTracker.exe setup` to pin
 your resolution, or see [CALIBRATION.md](CALIBRATION.md) to add a profile.
 
+**Running native 16:9?** The base regions are tuned for a 16:10-in-game capture; on a
+native-16:9 setup the summary screen sits differently. If nothing logs (or values are
+garbled) on native 16:9, pick **`1920x1080-native-16x9`** in the GUI's Resolution
+dropdown (or set `force_resolution` to it) — a built-in profile for that layout.
+
 To rebuild the `.exe` yourself, run [`build_release.bat`](build_release.bat) - it
 runs PyInstaller against [`apextracker.spec`](apextracker.spec) and assembles the
 zip. To run from source without building, see below.
@@ -72,12 +77,16 @@ pull the game off its fast present path to let anything outside the game see its
 pixels, which can cause micro-stutter. Pick the mode that suits you in the GUI's
 **Capture mode** dropdown (or `capture.mode` in `config.json`):
 
-- **Standalone — no OBS (default).** Captures in short on-demand bursts: it briefly
-  checks for the end screen, then closes capture and idles, so nothing is capturing
-  while you actually play. Removes the constant micro-stutter; you may notice a brief
-  blip every ~12s when it probes. Tune with `capture.idle_probe_seconds` (raise it to
-  probe less often — the end screen stays up ~30s so it's still caught).
-- **OBS Virtual Camera — zero game overhead.** Reads frames from OBS instead of
+- **Standalone — continuous (default).** Captures the monitor continuously and reads
+  the end screen reliably. Simple and dependable; the trade-off is that capturing an
+  exclusive-fullscreen game can cause some micro-stutter (run Apex in **Borderless
+  Windowed**, or use OBS mode below, to avoid it).
+- **Standalone — on-demand (BETA, opt-in).** Set `capture.on_demand: true`. Captures
+  in short bursts so gameplay isn't continuously captured (less stutter), but it only
+  glances at the screen every `idle_probe_seconds`, so it **can miss a match's end
+  screen and fail to log it**. Off by default for that reason; only use it if you've
+  confirmed it reliably logs your matches.
+- **OBS Virtual Camera — zero game overhead (recommended for zero stutter).** Reads frames from OBS instead of
   capturing the screen. If you already run OBS with a **Game Capture** of Apex, the
   tracker piggybacks on the frames OBS already has — no extra load on the game, no
   stutter, and you keep exclusive fullscreen. Still fully passive: we never touch the

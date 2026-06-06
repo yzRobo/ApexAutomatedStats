@@ -17,8 +17,8 @@
     "_video_res_help": "Resolution to request from the OBS Virtual Camera (mode 'obs'). Match your OBS Output (Scaled) Resolution - Settings > Video. Without this the camera defaults to 640x480, too small for the OCR. Use 1920x1080 (default) or 2560x1440 etc.",
     "video_width": 1920,
     "video_height": 1080,
-    "_on_demand_help": "true = capture only in short bursts: open capture, grab one frame to check for the end screen, close it, then idle. No capture session stays open while you play, so an EXCLUSIVE-FULLSCREEN game keeps its fast present path and stops the constant micro-stutter. Tradeoff: a brief hitch each time it probes (every idle_probe_seconds). The end screen stays up ~30s, so you can raise idle_probe_seconds to 10-15 to probe less often if you still feel it.",
-    "on_demand": true,
+    "_on_demand_help": "BETA / OPT-IN, default false. true = capture only in short bursts (open capture, grab a frame to check for the end screen, close it, then idle) so an EXCLUSIVE-FULLSCREEN game keeps its fast present path during play. WARNING: it only glances at the screen once every idle_probe_seconds, so it can MISS the end screen and fail to log a match (this is why it is not the default). For a stutter-free AND reliable setup, use mode 'obs' instead. Leave this false unless you've tested that it reliably logs your matches.",
+    "on_demand": false,
     "idle_probe_seconds": 12,
     "_debug_log_help": "true = append timestamped lines to debug/tracker_debug.log for every capture probe (when it opens capture, what it saw, when it idled). Use it to line probes up against any stutter you felt in-game. Set false once tuned.",
     "debug_log": false
@@ -47,7 +47,44 @@
   "name_match_cutoff": 0.8,
   "_resolution_help": "The regions below are measured at base_width x base_height (1920x1080) and auto-scale to whatever resolution is captured, which already covers any 16:9 res (1440p, 4K). force_resolution pins a profile key like '2560x1440' (run 'setup' to set it interactively, or pass --res); leave it empty to auto-detect each run. profiles holds per-resolution region sets for cases where pure scaling is slightly off - each profile carries its own base_width/base_height plus header/columns/rows/detect blocks measured at that native resolution, and is used as-is (no scaling) when its key matches. See CALIBRATION.md.",
   "force_resolution": "",
-  "profiles": {},
+  "profiles": {
+    "1920x1080-native-16x9": {
+      "_comment": "For players running Apex at NATIVE 16:9 (not the 16:10-squished-into-16:9 setup the base regions are tuned for). Same 1920x1080 capture size, but the summary screen spreads wider horizontally and taller vertically, so the cards/header/banner sit differently. Select this profile (force_resolution or the GUI resolution dropdown) if you run native 16:9 and the base regions miss.",
+      "base_width": 1920,
+      "base_height": 1080,
+      "value_width": 165,
+      "single_width": 82,
+      "detect": {
+        "banner": { "x": 700, "y": 158, "w": 490, "h": 52 },
+        "match_texts": ["CHAMPION", "ELIMINAT", "SQUAD"],
+        "gold_hsv_min": [18, 80, 110],
+        "gold_hsv_max": [42, 255, 255],
+        "gold_min_ratio": 0.02,
+        "red_hsv_min1": [0, 90, 90],
+        "red_hsv_max1": [10, 255, 255],
+        "red_hsv_min2": [168, 90, 90],
+        "red_hsv_max2": [180, 255, 255],
+        "red_min_ratio": 0.12
+      },
+      "header": {
+        "squad_placed": { "x": 1490, "y": 170, "w": 100, "h": 44 },
+        "total_kills": { "x": 1660, "y": 170, "w": 200, "h": 44 },
+        "session_id": { "x": 0, "y": 992, "w": 380, "h": 86 }
+      },
+      "columns": [
+        { "x": 216, "w": 215 },
+        { "x": 746, "w": 215 },
+        { "x": 1282, "w": 215 }
+      ],
+      "rows": {
+        "name": { "y": 314, "h": 36 },
+        "kak": { "y": 412, "h": 34 },
+        "damage": { "y": 485, "h": 34 },
+        "revive": { "y": 628, "h": 34 },
+        "respawn": { "y": 704, "h": 34 }
+      }
+    }
+  },
   "_dashboard_url_help": "Optional. URL of your online stats dashboard; the UI's Dashboard button opens it. Leave empty and the button will prompt to set one.",
   "dashboard_url": "",
   "detect": {
