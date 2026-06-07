@@ -50,7 +50,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -734,7 +734,12 @@ def already_logged_ids(path):
 
 def append_match(path, match):
     new_file = not os.path.exists(path)
-    ts = datetime.now().isoformat(timespec="seconds")
+    # Timezone-aware local time: .astimezone() attaches this PC's UTC offset, so the
+    # Supabase TIMESTAMPTZ column converts it to the CORRECT UTC instant. Without the
+    # offset, a naive datetime.now() gets stored AS-IF it were UTC, so two squadmates
+    # in different timezones logged the same match an hour apart. The CSV now shows
+    # local time with its offset (e.g. ...-04:00), which is unambiguous too.
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if new_file:
