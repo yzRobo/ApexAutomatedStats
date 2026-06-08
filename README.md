@@ -37,14 +37,18 @@ It does **not** update itself - you swap the files once, which keeps all your da
 Prefer a clean slate? You can instead unzip the new version into a fresh folder and
 copy your old `config.json` (and `apex_matches.csv` if you want the history) into it.
 
-Tuned for 1920x1080, and it **auto-scales to any 16:9 resolution** (1440p, 4K), so
-most setups just work. If your numbers look off, run `ApexTracker.exe setup` to pin
-your resolution, or see [CALIBRATION.md](CALIBRATION.md) to add a profile.
+**Resolution is auto-detected** and scales to any 16:9 resolution (1080p, 1440p, 4K) —
+you never pick a resolution. The one thing that matters is the **Display ratio** in the
+GUI:
 
-**Running native 16:9?** The base regions are tuned for a 16:10-in-game capture; on a
-native-16:9 setup the summary screen sits differently. If nothing logs (or values are
-garbled) on native 16:9, pick **`1920x1080-native-16x9`** in the GUI's Resolution
-dropdown (or set `force_resolution` to it) — a built-in profile for that layout.
+- **16:9 (native)** — the default; correct for almost everyone.
+- **16:10 in-game (on a 16:9 monitor)** — pick this only if you set a 16:10 aspect
+  *in-game* while on a 16:9 monitor (a stretched/competitive setup). It's tuned for that
+  specific case — **true 16:10 monitors and ultrawide (21:9) aren't calibrated yet** (grab
+  a frame with the Capture-frame button and send it if you need one added).
+
+If names/numbers look garbled, you're probably on the wrong ratio — switch it, **Save
+settings**, then **Stop → Start**. (See [CALIBRATION.md](CALIBRATION.md) to add a profile.)
 
 To rebuild the `.exe` yourself, run [`build_release.bat`](build_release.bat) - it
 runs PyInstaller against [`apextracker.spec`](apextracker.spec) and assembles the

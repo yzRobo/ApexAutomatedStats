@@ -28,8 +28,21 @@ from tkinter import ttk, messagebox
 
 import apex_tracker as core
 
-COMMON_RES = ["1920x1080", "2560x1440", "3440x1440", "3840x2160"]
-AUTO_LABEL = "Auto-detect"
+# Display-ratio picker. Resolution is auto-detected and auto-scaled, so the only
+# thing the user needs to choose is the in-game aspect / layout. Each maps to a
+# force_resolution value: "16:9" -> the native-16:9 calibration profile; "16:10"
+# -> "" (the base regions, which are tuned for 16:10-in-game on a 16:9 monitor).
+NATIVE_16x9_KEY = "1920x1080-native-16x9"
+RATIO_OPTIONS = [
+    ("16:9 (native) - default", NATIVE_16x9_KEY),
+    ("16:10 in-game (on a 16:9 monitor)", ""),
+]
+RES_BY_RATIO_LABEL = {label: res for label, res in RATIO_OPTIONS}
+
+
+def _ratio_label_for(force_res):
+    """Map a stored force_resolution to its Display-ratio label (default 16:9)."""
+    return RATIO_OPTIONS[0][0] if force_res == NATIVE_16x9_KEY else RATIO_OPTIONS[1][0]
 
 # Capture-mode picker: (menu label, (capture.mode, capture.on_demand)).
 #   ("monitor", False) = continuous WGC (reliable; the v1.2.x behavior).
@@ -154,15 +167,20 @@ class App:
         ttk.Button(addf, text="Add name", command=self._roster_add).pack(side="left", padx=6)
 
         resf = ttk.Frame(sett)
-        resf.pack(fill="x", padx=8, pady=(8, 2))
-        ttk.Label(resf, text="Resolution:").pack(side="left")
-        cur = self.cfg.get("force_resolution") or ""
-        values = [AUTO_LABEL] + sorted(set(COMMON_RES + list((self.cfg.get("profiles") or {}).keys())))
-        self.res_var = tk.StringVar(value=(cur if cur else AUTO_LABEL))
-        self.res_combo = ttk.Combobox(resf, textvariable=self.res_var, values=values,
-                                      state="readonly", width=16)
-        self.res_combo.pack(side="left", padx=6)
-        self.res_combo.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
+        resf.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(resf, text="Display ratio:").pack(side="left")
+        self.ratio_var = tk.StringVar(
+            value=_ratio_label_for(self.cfg.get("force_resolution") or ""))
+        self.ratio_combo = ttk.Combobox(resf, textvariable=self.ratio_var,
+                                        values=[lbl for lbl, _ in RATIO_OPTIONS],
+                                        state="readonly", width=34)
+        self.ratio_combo.pack(side="left", padx=6)
+        self.ratio_combo.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
+        ttk.Label(sett, wraplength=420, justify="left", foreground="#888",
+                  text="Resolution is auto-detected and scales to any 16:9 res (1080p/1440p/4K). "
+                       "Pick 16:10 only if you run a 16:10 aspect IN-GAME on a 16:9 monitor. "
+                       "True 16:10 monitors and ultrawide (21:9) aren't calibrated yet.").pack(
+            anchor="w", padx=8, pady=(2, 0))
 
         # Capture mode picker (continuous / on-demand / OBS).
         capf = ttk.Frame(sett)
@@ -346,8 +364,7 @@ class App:
     def save_settings(self):
         self.cfg = core.load_config()
         self.cfg["known_names"] = list(self.roster.get(0, "end"))
-        sel = self.res_var.get()
-        self.cfg["force_resolution"] = "" if sel == AUTO_LABEL else sel
+        self.cfg["force_resolution"] = RES_BY_RATIO_LABEL.get(self.ratio_var.get(), "")
         self.cfg["dashboard_url"] = self.dash_var.get().strip()
         mode, on_demand = SETTING_BY_LABEL.get(self.mode_var.get(), ("monitor", False))
         cap = self.cfg.setdefault("capture", {})

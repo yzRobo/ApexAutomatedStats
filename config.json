@@ -46,7 +46,7 @@
   ],
   "name_match_cutoff": 0.8,
   "_resolution_help": "The regions below are measured at base_width x base_height (1920x1080) and auto-scale to whatever resolution is captured, which already covers any 16:9 res (1440p, 4K). force_resolution pins a profile key like '2560x1440' (run 'setup' to set it interactively, or pass --res); leave it empty to auto-detect each run. profiles holds per-resolution region sets for cases where pure scaling is slightly off - each profile carries its own base_width/base_height plus header/columns/rows/detect blocks measured at that native resolution, and is used as-is (no scaling) when its key matches. See CALIBRATION.md.",
-  "force_resolution": "",
+  "force_resolution": "1920x1080-native-16x9",
   "profiles": {
     "1920x1080-native-16x9": {
       "_comment": "For players running Apex at NATIVE 16:9 (not the 16:10-squished-into-16:9 setup the base regions are tuned for). Same 1920x1080 capture size, but the summary screen spreads wider horizontally and taller vertically, so the cards/header/banner sit differently. Select this profile (force_resolution or the GUI resolution dropdown) if you run native 16:9 and the base regions miss.",
