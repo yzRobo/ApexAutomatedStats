@@ -56,7 +56,7 @@
       "single_width": 82,
       "detect": {
         "banner": { "x": 700, "y": 158, "w": 490, "h": 52 },
-        "match_texts": ["CHAMPION", "ELIMINAT", "SQUAD"],
+        "match_texts": ["CHAMPION", "ELIMINAT", "SQUAD", "SUMMAR"],
         "gold_hsv_min": [18, 80, 110],
         "gold_hsv_max": [42, 255, 255],
         "gold_min_ratio": 0.02,
@@ -98,7 +98,8 @@
     "match_texts": [
       "CHAMPION",
       "ELIMINAT",
-      "SQUAD"
+      "SQUAD",
+      "SUMMAR"
     ],
     "gold_hsv_min": [
       18,

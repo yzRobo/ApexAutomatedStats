@@ -50,7 +50,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -276,6 +276,19 @@ def ocr_gold_number(img_bgr, upscale=4):
         return ""
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([15, 80, 90]), np.array([42, 255, 255]))
+    iso = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
+    return digitize(_rec(iso, upscale))
+
+
+def ocr_white_number(img_bgr, upscale=3):
+    """Damage is white digits, and the colored character art behind the card can
+    bleed into the right of the box and add a phantom digit (e.g. '1,559' -> '15591').
+    Keep only the bright (white) pixels so just the number remains, then read it.
+    Position-independent, so it doesn't depend on the box width lining up exactly."""
+    if img_bgr is None or img_bgr.size == 0:
+        return ""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 165, 255, cv2.THRESH_BINARY)
     iso = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
     return digitize(_rec(iso, upscale))
 
@@ -640,7 +653,7 @@ def banner_text_present(frame, cfg, scale):
     ELIMINATED). Only called after the cheap color gate passes."""
     d = cfg["detect"]
     text = ocr_detect(crop(frame, scale(d["banner"]))).upper().replace(" ", "")
-    return any(k in text for k in d.get("match_texts", ["CHAMPION", "ELIMINAT", "SQUAD"]))
+    return any(k in text for k in d.get("match_texts", ["CHAMPION", "ELIMINAT", "SQUAD", "SUMMAR"]))
 
 
 def is_summary_screen(frame, cfg, scale):
@@ -668,7 +681,7 @@ def extract_match(frame, cfg, scale):
 
         name = snap_name(ocr_field(field("name", col["w"])), cfg)
         kills, assists, knocks = parse_kak(ocr_field(field("kak", value_w), numeric=True))
-        damage = parse_int(ocr_field(field("damage", value_w), numeric=True))
+        damage = parse_int(ocr_white_number(field("damage", value_w)))
         revive = parse_int(ocr_field(field("revive", single_w), numeric=True, single=True))
         respawn = parse_int(ocr_field(field("respawn", single_w), numeric=True, single=True))
 
