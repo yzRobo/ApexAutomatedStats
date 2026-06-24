@@ -12,6 +12,10 @@ python-dotenv==1.0.0
 # 'obs'). Optional - without it, OBS mode still works if you set video_device_index
 # manually; auto-detect just falls back to None.
 pygrabber==0.2
+# Sun Valley (Windows 11-style) ttk theme for the GUI. Ships .tcl theme files
+# that PyInstaller must bundle - build the UI exe with `--collect-all sv_ttk`
+# (see apextracker.spec / build_release.bat) or the frozen app crashes on launch.
+sv-ttk==2.6.1
 
 # Build-only (not needed at runtime):
 pyinstaller==6.11.1

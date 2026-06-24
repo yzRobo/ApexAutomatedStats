@@ -23,6 +23,11 @@ SETUP
    (type it in and click "Add name"), pick your Resolution if you
    want, and click "Save settings".
 
+4. (Optional - for Rank/RP tracking) In Settings, paste your own
+   FREE ALS API key into the "ALS API key" box and Save. Get one at
+   apexlegendsstatus.com -> sign in -> Settings -> API. Without a key,
+   kills/damage/placement still log fine; only Rank/RP needs it.
+
 ------------------------------------------------------------
 USING IT
 ------------------------------------------------------------

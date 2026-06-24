@@ -18,16 +18,36 @@
     "video_width": 1920,
     "video_height": 1080,
     "_on_demand_help": "BETA / OPT-IN, default false. true = capture only in short bursts (open capture, grab a frame to check for the end screen, close it, then idle) so an EXCLUSIVE-FULLSCREEN game keeps its fast present path during play. WARNING: it only glances at the screen once every idle_probe_seconds, so it can MISS the end screen and fail to log a match (this is why it is not the default). For a stutter-free AND reliable setup, use mode 'obs' instead. Leave this false unless you've tested that it reliably logs your matches.",
-    "on_demand": false,
+    "on_demand": true,
     "idle_probe_seconds": 12,
     "_debug_log_help": "true = append timestamped lines to debug/tracker_debug.log for every capture probe (when it opens capture, what it saw, when it idled). Use it to line probes up against any stutter you felt in-game. Set false once tuned.",
-    "debug_log": false
+    "debug_log": true,
+    "_summary_throttle_help": "Frame-delivery cap (ms) used ONLY while a summary banner is detected and held open for reading. The end screen is static and the game is idle there, so capturing fast costs nothing and lets the stability gate confirm the stats within a fraction of a second instead of waiting a full throttle_ms - this is what stops a quickly-dismissed summary from being read but never committed. Does NOT affect gameplay capture (throttle_ms still governs that). Lower = faster commit; 250 is plenty.",
+    "summary_throttle_ms": 250
   },
   "_low_priority_help": "Run the tracker at below-normal process priority so Windows favors Apex. Recommended true.",
   "low_priority": true,
   "poll_seconds": 1.0,
+  "_als_api_key_help": "Your ALS API key (FREE: apexlegendsstatus.com -> sign in -> Settings -> API). Required to track Rank/RP. Editable in the app's Settings so each user can use their own key. Stored here; if left blank, the owner's ALS_API_KEY in .env is used as a fallback. Blank + no .env key = RP tracking off.",
+  "als_api_key": "",
+  "_rank_poll_help": "Seconds between ALS rank-tracker polling cycles (how often the background thread queries each player's RP from the ALS API). Default 120 to mimic an active browser session. Requires an ALS key (als_api_key above or ALS_API_KEY in .env).",
+  "rank_poll_seconds": 120,
+  "_rp_sweep_help": "Seconds between RP-resolution sweeps. After a ranked match the player's RP is snapshotted (starting_rp) and the match is queued in rp_pending.json; this background sweep re-checks ALS every rp_sweep_seconds and fills in ending_rp/rp_change the moment EA's cache propagates the new RP (2-3 min, sometimes longer). The queue is durable: it survives app restarts and waits as long as it takes (up to rp_pending_expiry_hours) instead of giving up after a fixed window, so going into the next game quickly no longer loses the previous match's RP.",
+  "rp_sweep_seconds": 30,
+  "_rp_loss_floor_help": "Conservative single-match RP LOSS floor. RP gains are never capped (a high-kill win can be +500 or more). But a single ranked game can't lose more than its entry cost (~-50 to -65 even at the top tiers), so an observed drop more negative than this, while two+ matches are still pending, is treated as two results that propagated into one ALS reading and CANNOT be split - those matches are left blank (honest unknown) rather than guessing. Never drops the match itself (kills/damage/placement always log); only the RP attribution is held. -100 is ~2x the worst real single-game loss.",
+  "rp_loss_floor": -100,
+  "_rp_expiry_help": "Hours to keep trying to resolve a match's RP before giving up and dropping it from the pending queue (leaving its RP blank). Generous so a slow EA cache or an overnight gap still resolves.",
+  "rp_pending_expiry_hours": 24,
+  "_als_assume_zero_help": "If a match's RP never moves within the 5-min resolution window, true = record rp_change=0 (treat as a no-RP/floor-protected loss); false = leave it blank/null (default). WARNING: true also stamps 0 on NON-RANKED matches and on ranked matches whose RP propagated slower than 5 min, so it trades 'honest blanks' for 'occasional false zeros'. Leave false unless you only ever play ranked with the tracker on -- OR turn on ranked_detect_enabled, which makes assume-zero safe by skipping pubs entirely.",
+  "als_assume_zero_on_timeout": false,
+  "_ranked_detect_help": "Detect ranked vs pub matches by reading the top-right HUD rank badge during gameplay (the summary screen carries no rank marker), and stamp each match's 'ranked' column. Default true: pubs skip RP resolution (no wasted ALS polls, and als_assume_zero_on_timeout only ever applies to real ranked games). The badge region + threshold live in detect.ranked_badge / detect.ranked_edge_min. REQUIRES supabase_migration_ranked.sql to be applied, or Supabase will reject the 'ranked' column (the tracker retries the insert without it and warns, so syncing still works, but the flag won't store until the migration runs). NOTE: calibrated on Plat/Diamond badges -- verify it still latches on Bronze/Silver before relying on it.",
+  "ranked_detect_enabled": true,
+  "_ranked_check_help": "Seconds between rank-badge checks during gameplay (the check rides a frame the watch loop already grabbed, so it adds no capture). ~20-30 is plenty; the badge is on screen the whole match and two consecutive hits latch it.",
+  "ranked_check_seconds": 25,
   "_settle_help": "Seconds to wait after the end-screen banner appears before reading it, so placement/stats are fully drawn (prevents blank/partial rows).",
   "settle_seconds": 1.5,
+  "_stability_confirm_help": "Seconds the SAME stats must hold before a summary commits, as a fallback when fresh capture frames are sparse (high throttle_ms). The gate normally confirms by seeing the numbers reproduce on a genuinely newer frame; this wall-clock backstop guarantees a fully-rendered, plausible summary still commits even if a new frame hasn't arrived yet - so a quickly-dismissed end screen isn't read and then thrown away. Keep small.",
+  "stability_confirm_seconds": 0.8,
   "_heartbeat_help": "Seconds between 'still watching' status lines so you can tell it's alive. Set 0 to disable.",
   "heartbeat_seconds": 60,
   "csv_path": "apex_matches.csv",
@@ -45,8 +65,12 @@
     "SaWaii"
   ],
   "name_match_cutoff": 0.8,
+  "_als_uids_help": "Optional {name: uid} overrides for the ALS rank tracker. ALS can't always map an Apex display name to an account (notably Steam accounts), so list those players by UID here. PC/Steam = your SteamID64 (find it at apexlegendsstatus.com -> log in -> the number in your profile URL /profile/uid/PC/<uid>). Names not listed here are looked up by display name as usual.",
+  "als_uids": {
+    "yzRobo": "76561198029301970"
+  },
   "_resolution_help": "The regions below are measured at base_width x base_height (1920x1080) and auto-scale to whatever resolution is captured, which already covers any 16:9 res (1440p, 4K). force_resolution pins a profile key like '2560x1440' (run 'setup' to set it interactively, or pass --res); leave it empty to auto-detect each run. profiles holds per-resolution region sets for cases where pure scaling is slightly off - each profile carries its own base_width/base_height plus header/columns/rows/detect blocks measured at that native resolution, and is used as-is (no scaling) when its key matches. See CALIBRATION.md.",
-  "force_resolution": "1920x1080-native-16x9",
+  "force_resolution": "",
   "profiles": {
     "1920x1080-native-16x9": {
       "_comment": "For players running Apex at NATIVE 16:9 (not the 16:10-squished-into-16:9 setup the base regions are tuned for). Same 1920x1080 capture size, but the summary screen spreads wider horizontally and taller vertically, so the cards/header/banner sit differently. Select this profile (force_resolution or the GUI resolution dropdown) if you run native 16:9 and the base regions miss.",
@@ -55,33 +79,113 @@
       "value_width": 165,
       "single_width": 82,
       "detect": {
-        "banner": { "x": 700, "y": 158, "w": 490, "h": 52 },
-        "match_texts": ["CHAMPION", "ELIMINAT", "SQUAD", "SUMMAR"],
-        "gold_hsv_min": [18, 80, 110],
-        "gold_hsv_max": [42, 255, 255],
+        "banner": {
+          "x": 700,
+          "y": 158,
+          "w": 490,
+          "h": 52
+        },
+        "match_texts": [
+          "CHAMPION",
+          "ELIMINAT",
+          "SQUAD",
+          "SUMMAR"
+        ],
+        "gold_hsv_min": [
+          18,
+          80,
+          110
+        ],
+        "gold_hsv_max": [
+          42,
+          255,
+          255
+        ],
         "gold_min_ratio": 0.02,
-        "red_hsv_min1": [0, 90, 90],
-        "red_hsv_max1": [10, 255, 255],
-        "red_hsv_min2": [168, 90, 90],
-        "red_hsv_max2": [180, 255, 255],
-        "red_min_ratio": 0.12
+        "red_hsv_min1": [
+          0,
+          90,
+          90
+        ],
+        "red_hsv_max1": [
+          10,
+          255,
+          255
+        ],
+        "red_hsv_min2": [
+          168,
+          90,
+          90
+        ],
+        "red_hsv_max2": [
+          180,
+          255,
+          255
+        ],
+        "red_min_ratio": 0.12,
+        "ranked_badge": {
+          "x": 1820,
+          "y": 15,
+          "w": 95,
+          "h": 80
+        },
+        "ranked_edge_min": 0.12
       },
       "header": {
-        "squad_placed": { "x": 1490, "y": 170, "w": 100, "h": 44 },
-        "total_kills": { "x": 1660, "y": 170, "w": 200, "h": 44 },
-        "session_id": { "x": 0, "y": 992, "w": 380, "h": 86 }
+        "squad_placed": {
+          "x": 1490,
+          "y": 170,
+          "w": 100,
+          "h": 44
+        },
+        "total_kills": {
+          "x": 1660,
+          "y": 170,
+          "w": 200,
+          "h": 44
+        },
+        "session_id": {
+          "x": 0,
+          "y": 992,
+          "w": 380,
+          "h": 86
+        }
       },
       "columns": [
-        { "x": 216, "w": 215 },
-        { "x": 746, "w": 215 },
-        { "x": 1282, "w": 215 }
+        {
+          "x": 216,
+          "w": 215
+        },
+        {
+          "x": 746,
+          "w": 215
+        },
+        {
+          "x": 1282,
+          "w": 215
+        }
       ],
       "rows": {
-        "name": { "y": 302, "h": 36 },
-        "kak": { "y": 412, "h": 34 },
-        "damage": { "y": 485, "h": 34 },
-        "revive": { "y": 628, "h": 34 },
-        "respawn": { "y": 704, "h": 34 }
+        "name": {
+          "y": 302,
+          "h": 36
+        },
+        "kak": {
+          "y": 412,
+          "h": 34
+        },
+        "damage": {
+          "y": 485,
+          "h": 34
+        },
+        "revive": {
+          "y": 628,
+          "h": 34
+        },
+        "respawn": {
+          "y": 704,
+          "h": 34
+        }
       }
     }
   },
@@ -132,7 +236,15 @@
       255,
       255
     ],
-    "red_min_ratio": 0.12
+    "red_min_ratio": 0.12,
+    "_ranked_badge_help": "Top-right gameplay-HUD rank badge, read DURING play to tell ranked from pubs (the summary screen has no rank marker). Edge-density check: the ornate metallic emblem is edge-dense, the sky/terrain there in pubs is not. Box is in base 1920x1080 coords and auto-scales. Only used when ranked_detect_enabled is true.",
+    "ranked_badge": {
+      "x": 1820,
+      "y": 15,
+      "w": 95,
+      "h": 80
+    },
+    "ranked_edge_min": 0.12
   },
   "header": {
     "squad_placed": {
@@ -189,6 +301,5 @@
       "y": 671,
       "h": 33
     }
-  },
-  "dashboard_url": ""
+  }
 }

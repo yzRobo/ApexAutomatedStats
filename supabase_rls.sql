@@ -26,11 +26,20 @@ CREATE POLICY "anon insert matches"
 -- No SELECT/UPDATE/DELETE policies for anon = those operations are denied.
 
 -- ---------------------------------------------------------------------------
--- roster: only the owner (service_role) syncs this; anon gets nothing.
--- service_role bypasses RLS, so enabling RLS with no anon policy is enough.
+-- roster: only the owner (service_role) WRITES this. The dashboard READS it with
+-- the anon key — both the squad names and the live ALS rank snapshot
+-- (current_rp / rank_tier / rank_division), so anon needs SELECT. Writes stay
+-- owner-only (no INSERT/UPDATE/DELETE policy for anon); service_role bypasses RLS.
 -- ---------------------------------------------------------------------------
 ALTER TABLE public.roster ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.roster FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "anon read roster" ON public.roster;
+CREATE POLICY "anon read roster"
+  ON public.roster
+  FOR SELECT
+  TO anon
+  USING (true);
 
 -- ---------------------------------------------------------------------------
 -- OPTIONAL: if you build a public dashboard that reads stats with the anon key,

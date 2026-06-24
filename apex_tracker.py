@@ -28,7 +28,7 @@ import re
 import threading
 import ctypes
 import ctypes.wintypes as wt
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 
 try:
@@ -37,6 +37,8 @@ try:
 except ImportError:
     load_dotenv = None
     create_client = None
+
+from rank_tracker import RankTracker
 
 import numpy as np
 import cv2
@@ -50,7 +52,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.3.5"
+__version__ = "1.5.0"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -89,6 +91,105 @@ if load_dotenv and create_client:
             _SUPABASE_CLIENT = create_client(_url, _key)
         except Exception as e:
             print(f"Warning: Failed to initialize Supabase client: {e}")
+
+def _sync_ranks_to_supabase(snapshot):
+    """Upsert the live ALS rank snapshot onto the roster table (owner only).
+
+    Called after every rank-tracker poll cycle with ``{name: {current_rp,
+    rank_name, rank_div, ...}}``. Writes current_rp/rank_tier/rank_division so the
+    dashboard can show each player's CURRENT rank + RP without waiting for a
+    ranked match. Best-effort: never raises (RankTracker also guards the call).
+
+    Only the owner's service-role key may UPDATE roster; the insert-only anon key
+    (friends' builds) can't, so skip there — one owner instance keeps it fresh.
+    The existing name-only roster upsert won't clobber these columns.
+    """
+    if not _SUPABASE_CLIENT or not _SUPABASE_IS_SERVICE:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for name, entry in (snapshot or {}).items():
+        rp = entry.get("current_rp")
+        if rp is None:
+            continue  # ALS didn't resolve this player this cycle — leave prior snapshot
+        div = entry.get("rank_div")
+        rows.append({
+            "name": name,
+            "current_rp": rp,
+            "rank_tier": entry.get("rank_name") or None,
+            # ALS rankDiv is 1..4 (1=I highest .. 4=IV lowest); 0 = none/unknown
+            # (Master/Predator) -> store NULL.
+            "rank_division": div if div else None,
+            "rank_updated_at": now,
+        })
+    if not rows:
+        return
+    try:
+        _SUPABASE_CLIENT.table("roster").upsert(rows, on_conflict="name").execute()
+    except Exception as e:
+        print(f"(Supabase) rank snapshot sync skipped: {e}")
+
+
+# ALS rank tracker. Built lazily by init_rank_tracker(cfg) at watch START (not at
+# import), so an API key / roster / UID entered in the app's Settings applies on
+# Stop->Start with no app restart, and so importing this module has no network
+# side effects.
+_RANK_TRACKER = None
+_RANK_TRACKER_SIG = None  # (key, names, uids, poll) the live tracker was built for
+# If a match's RP never moves within the window, assume rp_change=0 (a no-RP /
+# floor-protected loss) instead of null. Off by default (can't tell a genuine 0
+# from a non-ranked match or slow propagation). config "als_assume_zero_on_timeout".
+_RANK_ASSUME_ZERO = False
+# Load .env once so the owner's ALS_API_KEY there is available as a FALLBACK to the
+# config.json key (which the Settings UI edits). Friends ship no ALS key in .env.
+if load_dotenv:
+    load_dotenv(os.path.join(HERE, ".env"))
+
+
+def _resolve_als_key(cfg):
+    """ALS key from config.json (Settings-editable) first, then the .env
+    ALS_API_KEY (the owner's existing setup). None when unset/placeholder."""
+    key = (cfg.get("als_api_key") or os.environ.get("ALS_API_KEY") or "").strip()
+    return key if key and "your_" not in key else None
+
+
+def init_rank_tracker(cfg):
+    """(Re)build the ALS rank tracker from the CURRENT config. Called at watch
+    start so an API key / roster / UID entered in Settings applies on Stop->Start
+    with no app restart. Idempotent: rebuilds only when those settings changed,
+    and tears the tracker down if the key was cleared."""
+    global _RANK_TRACKER, _RANK_TRACKER_SIG, _RANK_ASSUME_ZERO
+    _RANK_ASSUME_ZERO = bool(cfg.get("als_assume_zero_on_timeout", False))
+    key = _resolve_als_key(cfg)
+    if not key:
+        if _RANK_TRACKER is not None:
+            try:
+                _RANK_TRACKER.stop()
+            except Exception:
+                pass
+        _RANK_TRACKER, _RANK_TRACKER_SIG = None, None
+        return
+    names = list(cfg.get("known_names", []))
+    uids = dict(cfg.get("als_uids", {}) or {})
+    poll = cfg.get("rank_poll_seconds", 120)
+    sig = (key, tuple(names), tuple(sorted(uids.items())), poll)
+    if _RANK_TRACKER is not None and sig == _RANK_TRACKER_SIG:
+        return  # nothing relevant changed
+    if _RANK_TRACKER is not None:
+        try:
+            _RANK_TRACKER.stop()
+        except Exception:
+            pass
+    try:
+        _RANK_TRACKER = RankTracker(api_key=key, known_names=names,
+                                    poll_seconds=poll, uids=uids,
+                                    on_poll=_sync_ranks_to_supabase)
+        _RANK_TRACKER_SIG = sig
+        print(f"(ALS) Rank tracker started for {len(names)} players "
+              f"(poll every {poll}s).")
+    except Exception as e:
+        _RANK_TRACKER, _RANK_TRACKER_SIG = None, None
+        print(f"Warning: Failed to start rank tracker: {e}")
 
 # Keep OCR from grabbing every CPU core (which would hitch the game when it runs).
 os.environ.setdefault("OMP_NUM_THREADS", "2")
@@ -349,6 +450,29 @@ def clean_session_id(text):
     if m:
         return m.group(0)
     return re.sub(r"[^0-9A-Za-z:]", "", compact)
+
+
+# Upper bounds for a single player's per-match stats. Far above anything legitimately
+# reachable in an Apex match (a huge game tops out well under these), so anything past
+# them is an OCR misread - concatenated digits from a mid-animation or misaligned read.
+_MAX_DAMAGE = 25000
+_MAX_COUNT = 75  # kills / assists / knocks / revives / respawns
+
+
+def _stats_plausible(match):
+    """True if every player's stats are within physically-possible bounds. A read
+    that produces junk like 976561 damage or 1001 assists fails this, so the caller
+    can retry instead of logging garbage. Squad placement is 1-20."""
+    sp = match.get("squad_placed")
+    if sp is not None and not (1 <= sp <= 20):
+        return False
+    for p in match["players"]:
+        if (p.get("damage") or 0) > _MAX_DAMAGE:
+            return False
+        for k in ("kills", "assists", "knocks", "revive_given", "respawn_given"):
+            if (p.get(k) or 0) > _MAX_COUNT:
+                return False
+    return True
 
 
 def fingerprint(players):
@@ -661,6 +785,30 @@ def is_summary_screen(frame, cfg, scale):
     return banner_color_present(frame, cfg, scale) and banner_text_present(frame, cfg, scale)
 
 
+def ranked_badge_present(frame, cfg, scale):
+    """Cheap, OCR-free check for the ornate rank badge in the top-right gameplay
+    HUD. The summary screen carries NO rank/RP marker, so we read 'is this a
+    ranked match' off the live HUD badge during play and latch it for the match.
+
+    Detects the *presence* of the badge, not which rank: the metallic emblem +
+    division pips are edge-dense, whereas the sky/terrain that sits there in pubs
+    is nearly edge-free (saturation is useless here — blue sky out-saturates the
+    badge). A single Canny edge-density read on a small fixed crop, gated by the
+    default-off ``ranked_detect_enabled`` flag and confirmed across two samples by
+    the caller, so a one-frame busy background can't false-trigger.
+    """
+    d = cfg["detect"]
+    box = d.get("ranked_badge")
+    if not box:
+        return False
+    region = crop(frame, scale(box))
+    if region.size == 0:
+        return False
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    edge_density = float(cv2.Canny(gray, 80, 160).mean()) / 255.0
+    return edge_density >= d.get("ranked_edge_min", 0.12)
+
+
 # --------------------------------------------------------------------------- #
 # Extraction
 # --------------------------------------------------------------------------- #
@@ -711,7 +859,17 @@ CSV_FIELDS = [
     "timestamp", "session_id", "squad_placed", "total_squad_kills",
     "player_slot", "name", "kills", "assists", "knocks", "damage",
     "revive_given", "respawn_given",
+    "starting_rp", "ending_rp", "rp_change",
+    # Match-level: True/False once ranked detection (default-off) has run, else
+    # blank. Appended last so it never shifts the columns of pre-existing CSVs.
+    "ranked",
 ]
+
+# Serializes all writes to the CSV. append_match() runs on the watch loop while
+# the async RP-resolution threads rewrite the file to patch ending_rp; without
+# this lock a rewrite could clobber a freshly-appended match (or two rewrites
+# could lose each other's patches).
+_CSV_LOCK = threading.Lock()
 
 
 def csv_path(cfg):
@@ -745,6 +903,45 @@ def already_logged_ids(path):
     return seen
 
 
+def _ensure_canonical_header(path):
+    """Bring an existing CSV up to the current CSV_FIELDS schema, in place.
+
+    The schema grows over time (the `ranked` column was the latest add). A file
+    written under an older, shorter header becomes RAGGED once wider rows are
+    appended to it — the extra trailing values have no header column, so
+    csv.DictReader stuffs them under a None key and the next rewrite dies with
+    'dict contains fields not in fieldnames: None'. This rewrites the file once
+    with the full CSV_FIELDS header: existing columns are matched by name, missing
+    ones are padded blank, and any ragged trailing values are recovered positionally
+    into the new columns (so an already-appended `ranked` value is preserved).
+
+    Idempotent and cheap when the header already matches. The caller MUST already
+    hold _CSV_LOCK — this does not acquire it (the lock isn't reentrant)."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] == CSV_FIELDS:
+        return  # empty or already canonical
+    header = rows[0]
+    # Columns CSV_FIELDS adds beyond the old header, in order — these receive any
+    # ragged values that earlier wider appends wrote with no header column.
+    trailing_new = [c for c in CSV_FIELDS if c not in header]
+    out = []
+    for data in rows[1:]:
+        if not data:
+            continue
+        d = {col: data[i] for i, col in enumerate(header) if i < len(data)}
+        for col, val in zip(trailing_new, data[len(header):]):
+            d[col] = val
+        out.append(d)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for d in out:
+            w.writerow({k: d.get(k, "") for k in CSV_FIELDS})
+
+
 def append_match(path, match):
     new_file = not os.path.exists(path)
     # Timezone-aware local time: .astimezone() attaches this PC's UTC offset, so the
@@ -753,39 +950,69 @@ def append_match(path, match):
     # in different timezones logged the same match an hour apart. The CSV now shows
     # local time with its offset (e.g. ...-04:00), which is unambiguous too.
     ts = datetime.now().astimezone().isoformat(timespec="seconds")
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if new_file:
-            w.writeheader()
-            
-        supabase_rows = []
-        for p in match["players"]:
-            row_data = {
-                "timestamp": ts,
-                "session_id": match["session_id"],
-                "squad_placed": match["squad_placed"],
-                "total_squad_kills": match["total_squad_kills"],
-                **p,
-            }
-            w.writerow(row_data)
-            supabase_rows.append(row_data)
-            
-        if _SUPABASE_CLIENT:
-            try:
-                # returning="minimal" avoids reading the rows back, so this works
-                # under an insert-only RLS policy (no SELECT granted to anon).
-                _SUPABASE_CLIENT.table("apex_matches").insert(
-                    supabase_rows, returning="minimal"
-                ).execute()
-                print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(supabase_rows)} player records.")
-            except Exception as e:
+    supabase_rows = []
+    with _CSV_LOCK:
+        # Upgrade a pre-`ranked` (or otherwise older) file to the full header first,
+        # so appending wider rows can't produce a ragged file the patch step chokes on.
+        if not new_file:
+            _ensure_canonical_header(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            if new_file:
+                w.writeheader()
+
+            # Only attach `ranked` when detection actually ran (True/False). Left
+            # None when the default-off feature is disabled, so the key is omitted
+            # from the Supabase insert entirely — a project that hasn't run
+            # supabase_migration_ranked.sql keeps syncing fine (no PGRST204).
+            ranked = match.get("ranked")
+            for p in match["players"]:
+                row_data = {
+                    "timestamp": ts,
+                    "session_id": match["session_id"],
+                    "squad_placed": match["squad_placed"],
+                    "total_squad_kills": match["total_squad_kills"],
+                    **p,
+                }
+                if ranked is not None:
+                    row_data["ranked"] = ranked
+                w.writerow(row_data)
+                supabase_rows.append(row_data)
+
+    # Network sync runs outside the CSV lock so it can't block RP-patch threads.
+    if _SUPABASE_CLIENT:
+        def _insert(rows):
+            # returning="minimal" avoids reading the rows back, so this works
+            # under an insert-only RLS policy (no SELECT granted to anon).
+            _SUPABASE_CLIENT.table("apex_matches").insert(
+                rows, returning="minimal").execute()
+        try:
+            _insert(supabase_rows)
+            print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(supabase_rows)} player records.")
+        except Exception as e:
+            # If the project hasn't run supabase_migration_ranked.sql, the `ranked`
+            # column is missing and PostgREST rejects the WHOLE insert (PGRST204).
+            # Don't lose the match over a not-yet-applied migration: strip `ranked`
+            # and retry so the core stats still sync (the flag stays CSV-only until
+            # the column exists).
+            if "ranked" in str(e) and any("ranked" in r for r in supabase_rows):
+                stripped = [{k: v for k, v in r.items() if k != "ranked"}
+                            for r in supabase_rows]
+                try:
+                    _insert(stripped)
+                    print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(stripped)} "
+                          f"records WITHOUT 'ranked' - run supabase_migration_ranked.sql "
+                          f"to store the ranked flag.")
+                except Exception as e2:
+                    print(f"[{datetime.now():%H:%M:%S}] (Supabase) Error syncing to Supabase: {e2}")
+            else:
                 print(f"[{datetime.now():%H:%M:%S}] (Supabase) Error syncing to Supabase: {e}")
 
 
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
-def open_live_capture(cfg):
+def open_live_capture(cfg, throttle_override=None):
     """Open the live capture.
 
     mode "monitor" (default): capture the whole monitor Apex is on. This is the
@@ -800,7 +1027,11 @@ def open_live_capture(cfg):
     """
     cap_cfg = cfg.get("capture", {})
     exe_names = cap_cfg.get("exe_names", ["r5apex_dx12.exe", "r5apex.exe"])
-    throttle = cap_cfg.get("throttle_ms", 500)
+    # throttle_override lets the on-demand summary-read open a FAST session on the
+    # static end screen (so the stability gate's confirming frame arrives sub-second)
+    # without changing the gameplay throttle. None = use the configured throttle_ms.
+    throttle = (throttle_override if throttle_override is not None
+                else cap_cfg.get("throttle_ms", 500))
     mode = cap_cfg.get("mode", "monitor")
     hwnd = find_window_hwnd(exe_names)
 
@@ -944,6 +1175,8 @@ def draw_boxes(frame, cfg, scale):
         cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
         cv2.putText(out, label, (x, max(0, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     box(cfg["detect"]["banner"], (0, 255, 255), "banner")
+    if cfg["detect"].get("ranked_badge"):
+        box(cfg["detect"]["ranked_badge"], (0, 128, 255), "ranked_badge")
     for key, b in cfg["header"].items():
         box(b, (255, 0, 255), key)
     for slot, col in enumerate(cfg["columns"], start=1):
@@ -992,15 +1225,45 @@ def cmd_calibrate(arg, forced_res=None):
               f"dmg={p['damage']} rev={p['revive_given']} resp={p['respawn_given']}")
 
 
-def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb):
+def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
+                   ranked=None, stable=None, frame_ts=None):
     """Read a settled summary frame and log it if it's new and fully rendered.
     Returns 'incomplete' (still animating - try again), 'duplicate' (already
     logged), or 'logged'. Shared by the persistent and on-demand watch loops so
-    the dedup logic lives in exactly one place."""
+    the dedup logic lives in exactly one place.
+
+    ``stable``/``frame_ts`` drive the stability gate: the summary stats roll up
+    when the screen first appears, so a single read can catch plausible-but-wrong
+    mid-animation values (e.g. damage still climbing to its final number). We only
+    commit once the SAME stats are confirmed by a NEWER capture frame - i.e. the
+    numbers have stopped moving. ``stable`` is a mutable dict the caller keeps
+    across reads ({"fp", "ft"}); ``frame_ts`` is the current frame's capture time.
+    Omit both (calibrate/batch) to log immediately with no stability wait.
+
+    ``ranked`` is the per-match latch from the HUD badge detector: True (ranked),
+    False (pub), or None (detection disabled / never sampled). It is stored on the
+    match and gates RP resolution — pubs skip the ALS polling entirely, which is
+    also what makes ``als_assume_zero_on_timeout`` safe to enable. When detection
+    is off (None) the prior always-resolve behaviour is preserved exactly."""
     match = extract_match(frame, cfg_eff, scale)
-    # Wait until every player is named AND placement has rendered, so we never
-    # log a half-drawn screen (the cause of the earlier blank rows).
-    if any(not p["name"] for p in match["players"]) or match["squad_placed"] is None:
+    # Wait until every player is named, every stat field read, AND placement has
+    # rendered, so we never log a half-drawn screen. Names + placement alone is
+    # not enough: a card whose K/A/Kn or damage row failed OCR returns None for
+    # those, which earlier slipped through and logged blank-stat rows (e.g. a
+    # player with empty kills/assists/knocks). Treat any None stat as "still
+    # rendering" and retry. (None is distinct from a legit 0, which reads as 0.)
+    def _row_incomplete(p):
+        return (not p["name"] or p["kills"] is None or p["assists"] is None
+                or p["knocks"] is None or p["damage"] is None)
+    if any(_row_incomplete(p) for p in match["players"]) or match["squad_placed"] is None:
+        return "incomplete"
+    # Sanity gate: a mid-animation read (the stats roll up when the screen first
+    # appears) or a misaligned region can yield physically-impossible values -
+    # concatenated junk like 976561 damage or 1001 assists. Treat those as "not
+    # done rendering" and retry, so garbage never gets logged. This also prevents
+    # the double-log it caused: a garbage read has different stats AND a different
+    # session-id than the good read, so dedup can't collapse the two.
+    if not _stats_plausible(match):
         return "incomplete"
     if not match["session_id"]:
         match["session_id"] = match_key(match)  # persist so restarts dedup
@@ -1011,6 +1274,58 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb):
                           match["total_squad_kills"])
     if fp in seen or (sk and sk in seen):
         return "duplicate"
+
+    # Stability gate: only log once these exact stats are confirmed, so a
+    # mid-animation value (plausible but still rolling up) is never committed.
+    # Confirm by EITHER a genuinely newer capture frame reproducing the same
+    # fingerprint (the numbers stopped moving) OR — as a fallback when frames are
+    # sparse (high throttle_ms) — the same values holding for a short wall-clock
+    # window. Without the wall-clock fallback, a summary dismissed before the next
+    # (up to throttle_ms-spaced) frame arrives is read correctly and then thrown
+    # away; the fallback lets it commit after one extra poll instead.
+    if stable is not None:
+        now = time.time()
+        if fp != stable.get("fp"):
+            # New / changed read — (re)start the confirmation window.
+            stable["fp"] = fp
+            stable["ft"] = frame_ts if frame_ts is not None else 0.0
+            stable["seen"] = now
+            return "incomplete"
+        fresh_frame = frame_ts is not None and frame_ts > stable.get("ft", 0.0)
+        if frame_ts is not None:
+            stable["ft"] = frame_ts
+        confirm_secs = cfg_eff.get("stability_confirm_seconds", 0.8)
+        if not (fresh_frame or (now - stable.get("seen", now)) >= confirm_secs):
+            return "incomplete"
+
+    match["ranked"] = ranked
+    # RP only makes sense for ranked matches. With detection disabled (ranked is
+    # None) we keep the original always-resolve behaviour. With it ENABLED, the
+    # HUD-badge detector can still miss a genuine ranked game (short match, early
+    # death, or a rank tier it wasn't calibrated on), which would silently blank
+    # that match's RP. So unless assume-zero is on — where skipping pubs is exactly
+    # what keeps a false 0 off them — we fail OPEN on an unconfirmed (False) flag:
+    # still snapshot + queue resolution. A true pub then simply never moves RP and
+    # stays blank (no harm), while a misdetected ranked game keeps its RP.
+    do_rp = bool(_RANK_TRACKER) and (ranked is not False or not _RANK_ASSUME_ZERO)
+
+    # ── RP snapshot (starting_rp) ──
+    # Grab each player's current RP from the rank tracker cache RIGHT NOW.
+    # Because of the EA 2-3 min cache delay, this value is still the
+    # BEFORE-match RP. The ending_rp is resolved later by the durable RP queue
+    # (_enqueue_rp_pending -> the background sweep) once the EA cache updates.
+    if do_rp:
+        for p in match["players"]:
+            rp_now, _ = _RANK_TRACKER.get_rp(p["name"])
+            p["starting_rp"] = rp_now
+            p["ending_rp"] = None
+            p["rp_change"] = None
+    else:
+        for p in match["players"]:
+            p["starting_rp"] = None
+            p["ending_rp"] = None
+            p["rp_change"] = None
+
     append_match(path, match)
     seen.add(fp)
     if sk:
@@ -1020,6 +1335,7 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb):
         "session_id": match["session_id"],
         "placed": match["squad_placed"],
         "total_kills": match["total_squad_kills"],
+        "ranked": ranked,  # True / False / None(detection off) - shown by front-ends
         "time": datetime.now().strftime("%H:%M:%S"),
         "players": [{"name": p["name"], "kills": p["kills"],
                      "damage": p["damage"]} for p in match["players"]],
@@ -1030,7 +1346,288 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb):
             log_cb(dict(status["last_match"]))
         except Exception:
             pass
+
+    # ── Queue durable RP resolution (handles the EA cache delay) ──
+    if do_rp:
+        _enqueue_rp_pending(match, path)
+
     return "logged"
+
+
+# --------------------------------------------------------------------------- #
+# Durable RP resolution
+# --------------------------------------------------------------------------- #
+# Each logged ranked match snapshots every player's pre-match RP (starting_rp)
+# and drops a record in rp_pending.json next to the CSV; a single background
+# sweep fills in ending_rp/rp_change once EA's cache propagates the new RP. The
+# queue is DURABLE — it survives app restarts and is not bounded by a fixed
+# window (the old per-match thread gave up at 300 s and died when the app
+# closed). Because the baseline is frozen at match-end, queuing the next game
+# immediately can't corrupt the previous match's RP. A record is:
+#   {"session_id","name","player_slot","starting_rp","ranked","csv_path",
+#    "logged_epoch"}
+_RP_PENDING_LOCK = threading.Lock()
+_RP_RESOLVER_STARTED = False
+_RP_RESOLVER_STOP = threading.Event()
+
+
+def _rp_pending_path():
+    return os.path.join(HERE, "rp_pending.json")
+
+
+def _load_rp_pending():
+    path = _rp_pending_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_rp_pending(records):
+    """Atomic write (temp file + os.replace) so a crash/kill mid-write can't
+    truncate the queue."""
+    path = _rp_pending_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _enqueue_rp_pending(match, csv_path_str):
+    """Queue every baseline-bearing player of *match* for durable RP resolution.
+
+    The starting_rp snapshot was taken at log time (frozen pre/at-match RP); the
+    background sweep computes the delta once EA propagates. Players with no
+    baseline (None — e.g. ALS hadn't resolved them yet) are skipped, same as
+    before, but the sweep keeps the rest indefinitely instead of a 300 s window.
+    """
+    now = time.time()
+    new_records = [{
+        "session_id": match["session_id"],
+        "name": p["name"],
+        "player_slot": p["player_slot"],
+        "starting_rp": p["starting_rp"],
+        "ranked": match.get("ranked"),
+        "csv_path": csv_path_str,
+        "logged_epoch": now,
+    } for p in match["players"] if p.get("starting_rp") is not None]
+    if not new_records:
+        return
+    with _RP_PENDING_LOCK:
+        records = _load_rp_pending()
+        records.extend(new_records)
+        _save_rp_pending(records)
+    _ensure_rp_resolver()
+
+
+def _ensure_rp_resolver():
+    """Start the single background resolver thread once (idempotent). No-op when
+    no ALS key is configured (_RANK_TRACKER is None)."""
+    global _RP_RESOLVER_STARTED
+    if _RP_RESOLVER_STARTED or _RANK_TRACKER is None:
+        return
+    _RP_RESOLVER_STARTED = True
+    t = threading.Thread(target=_rp_resolver_loop, daemon=True, name="rp-resolver")
+    t.start()
+
+
+def _rp_resolver_loop():
+    try:
+        sweep_secs = max(10, int(load_config().get("rp_sweep_seconds", 30)))
+    except Exception:
+        sweep_secs = 30
+    while not _RP_RESOLVER_STOP.is_set():
+        try:
+            _rp_resolve_sweep()
+        except Exception as exc:
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP sweep error - {exc}")
+        if _RP_RESOLVER_STOP.wait(sweep_secs):
+            break
+
+
+def _rp_resolve_sweep():
+    """One pass over the pending queue: refresh ALS for the players still
+    awaiting RP, then resolve each player's EARLIEST pending match in
+    chronological order so baseline chaining holds (match B starts where A
+    ended). Conservatively flags collapsed multi-game jumps instead of guessing,
+    and never caps a positive (a high-kill win can be +500+)."""
+    if _RANK_TRACKER is None:
+        return
+    with _RP_PENDING_LOCK:
+        records = _load_rp_pending()
+    if not records:
+        return
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    loss_floor = cfg.get("rp_loss_floor", -100)
+    expiry_secs = cfg.get("rp_pending_expiry_hours", 24) * 3600
+    now = time.time()
+
+    fresh = [r for r in records if (now - r.get("logged_epoch", now)) < expiry_secs]
+    for r in records:
+        if r in fresh:
+            continue
+        # Expired: RP never propagated within the window. assume-zero (opt-in)
+        # stamps a 0 (floor-protected loss); otherwise leave an honest blank.
+        if _RANK_ASSUME_ZERO and r.get("starting_rp") is not None:
+            _safe_patch_rp(r.get("csv_path"), r["session_id"],
+                           {r["name"]: {"ending_rp": r["starting_rp"], "rp_change": 0}})
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP unresolved (expired) for "
+                  f"{r['session_id']} / {r['name']}: recorded 0 (assume-zero on).")
+        else:
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP expired unresolved for "
+                  f"{r['session_id']} / {r['name']} (left blank).")
+
+    names = sorted({r["name"] for r in fresh})
+    if names:
+        try:
+            _RANK_TRACKER.force_poll_names(names)
+        except Exception as exc:
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP poll error - {exc}")
+
+    resolved_keys = set()   # (session_id, name) -> drop from queue
+    rebaseline = {}         # (session_id, name) -> corrected starting_rp (chaining)
+
+    by_name = {}
+    for r in fresh:
+        by_name.setdefault(r["name"], []).append(r)
+
+    for name, recs in by_name.items():
+        current, _ = _RANK_TRACKER.get_rp(name)
+        if current is None:
+            continue  # ALS hasn't resolved this player yet — try next sweep
+        recs.sort(key=lambda r: r.get("logged_epoch", 0.0))
+        rec = recs[0]   # earliest unresolved match; later ones chain behind it
+        start = rec.get("starting_rp")
+        if start is None or current == start:
+            continue    # no movement yet
+        delta = current - start
+        key = (rec["session_id"], rec["name"])
+        if delta < loss_floor:
+            # A single ranked game can't lose this much, so this jump either
+            # collapsed two results into one ALS reading (two pending games) or
+            # spans an untracked game / cache glitch. Don't fabricate a split —
+            # leave this match's RP blank; the match row itself is untouched.
+            why = ("spans multiple pending games" if len(recs) >= 2
+                   else "exceeds a single-game loss (untracked game or glitch)")
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP ambiguous for "
+                  f"{rec['session_id']} / {name}: observed {delta:+d} {why}; "
+                  f"left blank (no fabricated split).")
+            resolved_keys.add(key)
+        else:
+            _safe_patch_rp(rec.get("csv_path"), rec["session_id"],
+                           {name: {"ending_rp": current, "rp_change": delta}})
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP resolved for "
+                  f"{rec['session_id']} / {name}: {delta:+d} (now {current}).")
+            resolved_keys.add(key)
+        # Chain: the next pending match for this player starts where this one's
+        # observed value now sits (whether we attributed it or flagged it).
+        if len(recs) >= 2:
+            nxt = recs[1]
+            rebaseline[(nxt["session_id"], nxt["name"])] = current
+
+    # Reconcile under the lock (a concurrent enqueue may have appended): drop
+    # resolved + expired, apply chained baselines, keep everything else.
+    with _RP_PENDING_LOCK:
+        records = _load_rp_pending()
+        out = []
+        for r in records:
+            key = (r.get("session_id"), r.get("name"))
+            if key in resolved_keys:
+                continue
+            if (now - r.get("logged_epoch", now)) >= expiry_secs:
+                continue
+            if key in rebaseline:
+                r = dict(r)
+                r["starting_rp"] = rebaseline[key]
+            out.append(r)
+        _save_rp_pending(out)
+
+
+def _safe_patch_rp(csv_path_str, session_id, resolved):
+    """Apply a resolved-RP patch to both the CSV and Supabase, isolating each so a
+    failure in one (e.g. a CSV rewrite hiccup) is logged but never aborts the
+    resolver thread or skips the other sink."""
+    try:
+        _patch_rp_in_csv(csv_path_str, session_id, resolved)
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] (ALS) CSV RP patch failed for {session_id}: {e}")
+    try:
+        _patch_rp_in_supabase(session_id, resolved)
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] (ALS) Supabase RP patch failed for {session_id}: {e}")
+
+
+def _patch_rp_in_csv(csv_path_str, session_id, resolved):
+    """Re-read the CSV, update matching rows with ending_rp / rp_change, rewrite.
+
+    *resolved* is ``{name: {"ending_rp": int, "rp_change": int}}``.  Only rows
+    whose ``session_id`` matches are touched.
+    """
+    if not os.path.exists(csv_path_str):
+        return
+    # Hold the lock across the whole read-modify-rewrite so a concurrent
+    # append_match() (or another patch thread) can't clobber the file.
+    with _CSV_LOCK:
+        # Normalize the header first so an older/ragged file reads cleanly (no None
+        # restkey) and writes back against the canonical schema.
+        _ensure_canonical_header(csv_path_str)
+        with open(csv_path_str, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+        if not fieldnames:
+            return  # empty / headerless file, nothing to patch
+        changed = False
+        for row in rows:
+            row.pop(None, None)  # defensive: drop any ragged extra-value restkey
+            if row.get("session_id") == session_id and row.get("name") in resolved:
+                rp_data = resolved[row["name"]]
+                row["ending_rp"] = rp_data["ending_rp"]
+                row["rp_change"] = rp_data["rp_change"]
+                changed = True
+        if not changed:
+            return
+        # Ensure every canonical column exists in the header even if the file predates it.
+        for col in CSV_FIELDS:
+            if col not in fieldnames:
+                fieldnames.append(col)
+        # Atomic rewrite: write a temp file then os.replace() it over the real
+        # path, so a crash/kill mid-write (e.g. app closed while a resolver is
+        # patching) can never leave a truncated apex_matches.csv.
+        tmp = csv_path_str + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, csv_path_str)
+
+
+def _patch_rp_in_supabase(session_id, resolved):
+    """Update Supabase rows with the resolved ending_rp and rp_change.
+
+    *resolved* is ``{name: {"ending_rp": int, "rp_change": int}}``.
+    """
+    if not _SUPABASE_CLIENT:
+        return
+    for name, rp_data in resolved.items():
+        try:
+            _SUPABASE_CLIENT.table("apex_matches").update({
+                "ending_rp": rp_data["ending_rp"],
+                "rp_change": rp_data["rp_change"],
+            }).eq("session_id", session_id).eq("name", name).execute()
+        except Exception as e:
+            print(f"[{datetime.now():%H:%M:%S}] (Supabase) RP patch error for {name}: {e}")
 
 
 def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None):
@@ -1047,6 +1644,11 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     import threading as _th
     stop_event = stop_event or _th.Event()
     sync_roster_to_supabase(cfg)
+    # (Re)build the ALS rank tracker from the current config so an API key / roster
+    # entered in Settings applies now (Stop->Start) without an app restart, then
+    # resume resolving any RP left pending from a previous session (durable queue).
+    init_rank_tracker(cfg)
+    _ensure_rp_resolver()
     forced = forced_res or cfg.get("force_resolution") or None
     path = csv_path(cfg)
     seen = already_logged_ids(path)
@@ -1062,7 +1664,7 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
               "logged_this_run": 0,
               "already_logged": sum(1 for k in seen if k.startswith("stat:")),
               "last_match": None, "csv_path": path, "resolution": None,
-              "profile": None, "event": "start"}
+              "profile": None, "match_ranked": False, "event": "start"}
 
     def emit(event):
         status["event"] = event
@@ -1105,6 +1707,19 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     announced = False
     banner_logged = False
     settle = cfg.get("settle_seconds", 1.5)
+    # Ranked-match detection (default off). During gameplay we throttle-check the
+    # top-right HUD badge on frames the loop already grabbed (no extra capture) and
+    # latch match_ranked for the match; two consecutive positives are required so a
+    # single busy background frame can't false-trigger. The latch is consumed when
+    # the summary is logged, then reset for the next match.
+    ranked_enabled = cfg.get("ranked_detect_enabled", False)
+    ranked_check_secs = cfg.get("ranked_check_seconds", 25)
+    match_ranked = False
+    ranked_confirm = 0
+    last_ranked_check = 0.0
+    # Carries the last summary read's fingerprint + capture time for the stability
+    # gate, so we only log once the rolling stats have settled (see _try_log_match).
+    stable = {"fp": None, "ft": 0.0}
     try:
         while not stop_event.is_set():
             age = cap.last_frame_age()
@@ -1156,6 +1771,22 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                     summary_handled = False
                     banner_since = None
                     banner_logged = False
+                    stable["fp"] = None  # fresh stability tracking next summary
+                # We're off the summary (gameplay/lobby) — the only time the rank
+                # badge is on screen. Throttle-check it and latch on two consecutive
+                # hits. Reuses this already-grabbed frame, so it adds no capture.
+                if ranked_enabled and not match_ranked and \
+                        time.time() - last_ranked_check >= ranked_check_secs:
+                    last_ranked_check = time.time()
+                    if ranked_badge_present(frame, cfg_eff, scale):
+                        ranked_confirm += 1
+                        if ranked_confirm >= 2:
+                            match_ranked = True
+                            status["match_ranked"] = True
+                            emit("ranked")  # live "badge grabbed" signal for front-ends
+                            dbg("ranked badge confirmed; match flagged RANKED")
+                    else:
+                        ranked_confirm = 0
                 stop_event.wait(poll)
                 continue
             absent_since = None
@@ -1176,9 +1807,20 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                 continue
 
             result = _try_log_match(frame, cfg_eff, scale, path, seen,
-                                    status, emit, log_cb)
+                                    status, emit, log_cb,
+                                    ranked=(match_ranked if ranked_enabled else None),
+                                    stable=stable,
+                                    frame_ts=time.time() - cap.last_frame_age())
             if result != "incomplete":
                 summary_handled = True  # this summary instance is now processed
+                stable["fp"] = None     # done with this summary; reset stability
+                # Latch consumed for this match — reset for the next one. (Can't
+                # reset in the banner-absent branch above: that runs every gameplay
+                # frame and would wipe the detection before the summary is read.)
+                match_ranked = False
+                ranked_confirm = 0
+                last_ranked_check = 0.0
+                status["match_ranked"] = False
                 dbg(f"read result: {result}"
                     + (f" (now {status['logged_this_run']} logged this run)"
                        if result == "logged" else ""))
@@ -1224,11 +1866,25 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
     summary by then, so a brief active capture is fine), then close and idle again.
     """
     idle_probe = cfg.get("capture", {}).get("idle_probe_seconds", 8)
+    # Open each probe FAST so that once a summary banner is caught and the session
+    # is held open, the stability gate's confirming frame arrives sub-second
+    # instead of waiting a full throttle_ms. The end screen is static (game idle),
+    # so capturing fast there adds no gameplay stutter; a gameplay probe only ever
+    # grabs one frame before releasing, so the throttle is irrelevant to it.
+    summary_throttle = cfg.get("capture", {}).get("summary_throttle_ms", 250)
     dbg = _make_debug_logger(cfg)
     dbg(f"on-demand watch started; idle_probe={idle_probe}s settle={settle_seconds}s "
         f"poll={poll}s csv={path}")
     announced = False
     last_hb = time.time()
+    # Ranked-badge latch (see run_watch). Here the check rides each idle probe
+    # frame rather than the continuous poll, but the latch/consume logic matches.
+    ranked_enabled = cfg.get("ranked_detect_enabled", False)
+    ranked_check_secs = cfg.get("ranked_check_seconds", 25)
+    match_ranked = False
+    ranked_confirm = 0
+    last_ranked_check = 0.0
+    stable = {"fp": None, "ft": 0.0}  # stability gate state (see _try_log_match)
 
     def heartbeat_or_tick():
         nonlocal last_hb
@@ -1242,7 +1898,7 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
     while not stop_event.is_set():
         probe_n += 1
         t_open = time.time()
-        cap, src, hwnd = open_live_capture(cfg)
+        cap, src, hwnd = open_live_capture(cfg, throttle_override=summary_throttle)
         status["src"] = src
         got = cap.wait_first(5)
         frame = cap.grab() if got else None
@@ -1270,6 +1926,20 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
         status["frame_age"] = cap.last_frame_age()
 
         if not banner_color_present(frame, cfg_eff, scale):
+            # Gameplay probe — check the rank badge on this frame before dropping
+            # the session, latching on two consecutive hits (same as run_watch).
+            if ranked_enabled and not match_ranked and \
+                    time.time() - last_ranked_check >= ranked_check_secs:
+                last_ranked_check = time.time()
+                if ranked_badge_present(frame, cfg_eff, scale):
+                    ranked_confirm += 1
+                    if ranked_confirm >= 2:
+                        match_ranked = True
+                        status["match_ranked"] = True
+                        emit("ranked")  # live "badge grabbed" signal for front-ends
+                        dbg("ranked badge confirmed; match flagged RANKED")
+                else:
+                    ranked_confirm = 0
             # No end screen - drop the session immediately. This is the clean,
             # zero-capture gameplay window where the game runs stutter-free.
             cap.release()
@@ -1283,6 +1953,7 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
         # cadence until it settles and we can log it.
         dbg(f"probe #{probe_n}: BANNER COLOUR seen -> holding session open to read")
         banner_since = time.time()
+        stable["fp"] = None  # fresh stability tracking for this summary
         while not stop_event.is_set():
             frame = cap.grab()
             if frame is None:
@@ -1300,11 +1971,20 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
                 stop_event.wait(poll)   # banner colour but not a summary banner
                 continue
             result = _try_log_match(frame, cfg_eff, scale, path, seen,
-                                    status, emit, log_cb)
+                                    status, emit, log_cb,
+                                    ranked=(match_ranked if ranked_enabled else None),
+                                    stable=stable,
+                                    frame_ts=time.time() - cap.last_frame_age())
             dbg(f"  read result: {result}"
                 + (f" (now {status['logged_this_run']} logged this run)"
                    if result == "logged" else ""))
             if result != "incomplete":
+                stable["fp"] = None     # done with this summary; reset stability
+                # Latch consumed for this match; reset for the next one.
+                match_ranked = False
+                ranked_confirm = 0
+                last_ranked_check = 0.0
+                status["match_ranked"] = False
                 break   # logged or already-seen; stop reading this summary
             stop_event.wait(poll)     # still animating in; retry
         cap.release()
@@ -1338,6 +2018,9 @@ def cmd_watch(forced_res=None):
                       f"(no profile for this resolution).")
         elif ev == "reacquire":
             print(f"[{datetime.now():%H:%M:%S}] re-acquired {s['src']}")
+        elif ev == "ranked":
+            print(f"[{datetime.now():%H:%M:%S}] RANKED badge detected - this match "
+                  f"will be tagged ranked.")
         elif ev == "heartbeat":
             age = s.get("frame_age") or 0
             health = (f"capture OK ({age:.0f}s old frame)" if s["state"] == "watching"
@@ -1347,7 +2030,9 @@ def cmd_watch(forced_res=None):
 
     def log_cb(m):
         names = ", ".join(f"{p['name']}({p['kills']}k/{p['damage']}dmg)" for p in m["players"])
-        print(f"[{datetime.now():%H:%M:%S}] logged {m['session_id']}  "
+        # Show how the match was tagged: RANKED / PUB, or nothing if detection is off.
+        tag = {True: " [RANKED]", False: " [PUB]"}.get(m.get("ranked"), "")
+        print(f"[{datetime.now():%H:%M:%S}] logged {m['session_id']}{tag}  "
               f"#{m['placed']} {m['total_kills']}k -> {names}")
 
     stop_event = threading.Event()
@@ -1398,6 +2083,15 @@ def cmd_setup():
 
 
 def main():
+    # OCR'd gamertags can contain non-Latin glyphs the default Windows console
+    # (cp1252) can't encode, which would crash any print() of a name (batch,
+    # calibrate, and the live watcher's per-match line). Degrade unencodable
+    # chars instead of raising. Best-effort: a redirected/None stdout just skips.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     args = sys.argv[1:]
     # Pull out an optional "--res WIDTHxHEIGHT" override from anywhere in the args.
     forced_res = None

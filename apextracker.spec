@@ -19,6 +19,7 @@ for pkg in (
     "rapidocr_onnxruntime",  # OCR engine + bundled .onnx models + config yaml
     "onnxruntime",           # native inference DLLs
     "windows_capture",       # compiled WGC capture extension
+    "sv_ttk",                # Sun Valley GUI theme - .tcl files, else UI exe crashes
     "supabase",              # + its sub-clients below for the stats sync
     "postgrest",
     "gotrue",
