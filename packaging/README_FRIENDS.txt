@@ -39,18 +39,16 @@ USING IT
 - "Check for updates" tells you if a newer version is available.
 
 ------------------------------------------------------------
-UPDATING
+UPDATING  (now one click!)
 ------------------------------------------------------------
-"Check for updates" will tell you when there's a new version, but it
-does NOT update itself. To update (this keeps your settings + history):
-  1. Close the app.
-  2. Download the new ApexTracker_share.zip and unzip it somewhere.
-  3. Copy ApexTracker.exe, ApexTrackerUI.exe, and the _internal folder
-     from the new unzip into your existing folder, overwriting them.
-  4. Do NOT overwrite config.json, .env, or apex_matches.csv - those are
-     your roster/settings and match history. (Copying only the 3 items
-     in step 3 leaves them untouched.)
-  5. Reopen ApexTrackerUI.exe.
+The app checks for new versions on launch. When one is available, the
+button at the bottom changes to "Update now -> vX.Y.Z". Click it, confirm,
+and the app downloads the update, installs it, and reopens itself - all
+automatically. Your roster/settings and match history are kept.
+
+(That's it - no more downloading zips or copying files. The one-click
+updater is built into v1.5.2 and newer; if you're on an older build, do
+this last manual update to v1.5.2 and you'll be auto-updating after that.)
 
 ------------------------------------------------------------
 NOTES

@@ -196,6 +196,7 @@ class App:
         self._stop = None
         self._latest = {"state": "idle", "event": "tick"}
         self._update_result = _UNSET  # set by the update-check thread (may be None)
+        self._update_silent = False   # True = startup auto-check (quiet unless update)
         self._dirty = False  # unsaved settings changes
 
         root.title(f"Apex Tracker  v{core.__version__}")
@@ -206,6 +207,9 @@ class App:
         self._build()
         self._set_running(False)
         self._refresh()  # start the 500ms UI poll
+        # Quietly check for a newer release on launch; only surfaces (as a
+        # one-click "Update now" button) if one exists.
+        self.root.after(2000, lambda: self.check_updates(silent=True))
 
     # ------------------------------------------------------------------ theme
     def _apply_theme(self):
@@ -792,33 +796,88 @@ class App:
                 "Paste your stats dashboard URL into Settings -> Dashboard URL, "
                 "then Save settings.")
 
-    def check_updates(self):
-        self.update_lbl.config(text="Checking...")
-        self.update_btn.config(state="disabled")
+    def check_updates(self, silent=False):
+        """Check GitHub for a newer release. silent=True (the startup auto-check)
+        only surfaces the result if an update exists; manual checks show feedback."""
+        self._update_silent = silent
+        if not silent:
+            self.update_lbl.config(text="Checking...", foreground=MUTED)
+            self.update_btn.config(state="disabled")
 
         def worker():
-            self._update_result = core.latest_release_version()
+            self._update_result = core.latest_release_info()
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_update_result(self, tag):
+    def _show_update_result(self, result):
+        tag, zip_url = result if isinstance(result, tuple) else (result, None)
         self.update_btn.config(state="normal")
         if not tag:
-            self.update_lbl.config(
-                text="Couldn't reach GitHub - try again later.", foreground=RED)
+            if not self._update_silent:
+                self.update_lbl.config(
+                    text="Couldn't reach GitHub - try again later.", foreground=RED)
             return
-        latest = tag.lstrip("v")
-        if latest == core.__version__:
-            self.update_lbl.config(
-                text=f"Up to date (v{core.__version__}).", foreground=GREEN)
+        if not core.update_available(tag):
+            if not self._update_silent:
+                self.update_lbl.config(
+                    text=f"Up to date (v{core.__version__}).", foreground=GREEN)
+            return
+        # A newer version exists — surface a one-click Update button (the prompt);
+        # clicking it confirms, then downloads + self-installs + relaunches.
+        self.update_lbl.config(text=f"New version available: {tag}", foreground=AMBER)
+        self.update_btn.config(text=f"Update now → {tag}",
+                               command=lambda: self._do_update(tag, zip_url))
+
+    def _do_update(self, tag, zip_url):
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Update", "Self-update only works in the packaged app. You're "
+                "running from source — use git to update.")
+            return
+        if not zip_url:
+            webbrowser.open(f"https://github.com/{core.REPO}/releases/latest")
+            return
+        if not messagebox.askyesno(
+                "Update",
+                f"Update to {tag} now?\n\nThe app will close, update itself, and "
+                "reopen automatically. Your settings and match history are kept."):
+            return
+        self.update_btn.config(state="disabled", text="Updating...")
+        self.update_lbl.config(text="Downloading...", foreground=MUTED)
+
+        def worker():
+            try:
+                def prog(frac):
+                    self.root.after(0, lambda: self.update_lbl.config(
+                        text=f"Downloading... {int(frac * 100)}%"))
+                staging = core.download_update(zip_url, progress_cb=prog)
+                self.root.after(0, lambda: self._finish_update(staging))
+            except Exception as e:
+                self.root.after(0, lambda err=e: (
+                    self.update_btn.config(state="normal", text="Check for updates",
+                                           command=self.check_updates),
+                    self.update_lbl.config(text=f"Update failed: {err}", foreground=RED)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update(self, staging):
+        self.update_lbl.config(text="Installing - the app will reopen...")
+        if self._stop:
+            self._stop.set()  # stop the watcher so its files unlock
+        if core.apply_update_and_restart(staging):
+            # Helper is waiting for us to exit so it can swap files; exit now.
+            self.root.after(400, self._exit_for_update)
         else:
-            self.update_lbl.config(
-                text=f"Update available: {tag}", foreground=RED)
-            if messagebox.askyesno(
-                    "Update available",
-                    f"You have v{core.__version__}; {tag} is available.\n\nOpen the "
-                    f"download page?"):
-                webbrowser.open(f"https://github.com/{core.REPO}/releases/latest")
+            self.update_btn.config(state="normal", text="Check for updates",
+                                   command=self.check_updates)
+            self.update_lbl.config(text="Update couldn't start.", foreground=RED)
+
+    def _exit_for_update(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
     def _on_close(self):
         if self._stop:

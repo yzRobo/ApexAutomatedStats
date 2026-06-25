@@ -52,13 +52,20 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
 def latest_release_version(timeout=4):
     """Return the latest GitHub release tag (e.g. 'v1.2.0'), or None on failure.
     Stdlib only; used by the GUI's update check. Never raises."""
+    return latest_release_info(timeout)[0]
+
+
+def latest_release_info(timeout=6):
+    """Return ``(tag, zip_url)`` for the latest GitHub release, or ``(None, None)``.
+    ``zip_url`` is the ApexTracker_share.zip asset's download URL. Stdlib only;
+    never raises. Used by the GUI's update check + one-click self-updater."""
     import urllib.request
     url = f"https://api.github.com/repos/{REPO}/releases/latest"
     try:
@@ -66,9 +73,125 @@ def latest_release_version(timeout=4):
             url, headers={"Accept": "application/vnd.github+json",
                           "User-Agent": "apex-tracker"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r).get("tag_name")
+            data = json.load(r)
+        zip_url = None
+        for asset in data.get("assets") or []:
+            if (asset.get("name") or "").lower().endswith(".zip"):
+                zip_url = asset.get("browser_download_url")
+                break
+        return data.get("tag_name"), zip_url
     except Exception:
-        return None
+        return None, None
+
+
+def _version_tuple(v):
+    nums = re.findall(r"\d+", v or "")[:3]
+    return tuple(int(n) for n in nums) + (0,) * (3 - len(nums))
+
+
+def update_available(latest_tag):
+    """True if *latest_tag* (e.g. 'v1.5.2') is a newer version than this build."""
+    return bool(latest_tag) and _version_tuple(latest_tag) > _version_tuple(__version__)
+
+
+# --------------------------------------------------------------------------- #
+# One-click self-update (frozen build only)
+# --------------------------------------------------------------------------- #
+# The packaged app is a one-folder build (the two exes + a ~238 MB _internal/).
+# To update without the user manually replacing files, we download the new
+# release zip, then hand off to a tiny batch helper that — once THIS process has
+# exited so the files unlock — swaps in the new exes + _internal and relaunches.
+# User files (config.json, .env, the CSV, rp_pending.json) are NEVER touched: the
+# helper only replaces _internal + the two exes. The swap is move-based so a
+# failed copy leaves the working install intact.
+_UPDATE_BAT = r'''@echo off
+setlocal enableextensions
+set "SRC={src}"
+set "DST={dst}"
+REM Wait for the app (PID {pid}) to fully exit so its files unlock.
+set /a n=0
+:wait
+tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
+if not errorlevel 1 (
+  set /a n+=1
+  if %n% LSS 150 ( ping -n 2 127.0.0.1 >nul & goto wait )
+)
+REM Copy the new _internal alongside the old one; only swap if it copied cleanly
+REM (robocopy returns < 8 on success).
+robocopy "%SRC%\_internal" "%DST%\_internal_new" /E /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 goto fail
+if exist "%DST%\_internal_old" rmdir /s /q "%DST%\_internal_old"
+move "%DST%\_internal" "%DST%\_internal_old" >nul
+move "%DST%\_internal_new" "%DST%\_internal" >nul
+copy /y "%SRC%\ApexTracker.exe" "%DST%\ApexTracker.exe" >nul
+copy /y "%SRC%\ApexTrackerUI.exe" "%DST%\ApexTrackerUI.exe" >nul
+rmdir /s /q "%DST%\_internal_old" 2>nul
+rmdir /s /q "%DST%\_update_staging" 2>nul
+start "" "%DST%\{ui}"
+del "%~f0"
+exit /b 0
+:fail
+if exist "%DST%\_internal_new" rmdir /s /q "%DST%\_internal_new"
+if not exist "%DST%\_internal" if exist "%DST%\_internal_old" move "%DST%\_internal_old" "%DST%\_internal" >nul
+start "" "%DST%\{ui}"
+del "%~f0"
+exit /b 1
+'''
+
+
+def download_update(zip_url, progress_cb=None, timeout=120):
+    """Download the release zip and extract it to a staging folder next to the exe.
+    Returns the staged ``ApexTracker`` dir. Raises on failure. ``progress_cb`` is
+    called with a 0.0–1.0 fraction as bytes arrive (best-effort)."""
+    import urllib.request
+    import zipfile
+    import shutil
+    staging_root = os.path.join(HERE, "_update_staging")
+    shutil.rmtree(staging_root, ignore_errors=True)
+    os.makedirs(staging_root, exist_ok=True)
+    zip_path = os.path.join(staging_root, "update.zip")
+    req = urllib.request.Request(zip_url, headers={"User-Agent": "apex-tracker"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        with open(zip_path, "wb") as f:
+            while True:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress_cb and total:
+                    try:
+                        progress_cb(done / total)
+                    except Exception:
+                        pass
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(staging_root)
+    try:
+        os.remove(zip_path)
+    except OSError:
+        pass
+    inner = os.path.join(staging_root, "ApexTracker")
+    return inner if os.path.isdir(inner) else staging_root
+
+
+def apply_update_and_restart(staging_dir):
+    """Write + launch the helper batch that swaps in *staging_dir* after this
+    process exits, then relaunches the UI. Frozen build only. Returns True if the
+    helper was launched (the caller MUST then exit the process); False otherwise."""
+    import subprocess
+    if not getattr(sys, "frozen", False) or not os.path.isdir(staging_dir):
+        return False
+    bat = os.path.join(HERE, "_apply_update.bat")
+    script = _UPDATE_BAT.format(pid=os.getpid(), src=staging_dir, dst=HERE,
+                                ui="ApexTrackerUI.exe")
+    with open(bat, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
+        f.write(script)
+    DETACHED_PROCESS = 0x00000008
+    subprocess.Popen(["cmd", "/c", bat], creationflags=DETACHED_PROCESS,
+                     close_fds=True)
+    return True
 
 # Initialize Supabase client if configured.
 # Key preference: a SERVICE_ROLE key (the project owner's own machine — full
