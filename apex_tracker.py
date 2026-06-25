@@ -52,7 +52,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.2"
+__version__ = "1.5.3"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -774,19 +774,48 @@ class WGCCapture:
 
 def find_video_device_index(name_hint="OBS Virtual"):
     """Return the index of the first video input device whose name contains
-    name_hint (default the OBS Virtual Camera), or None. Uses pygrabber's
-    DirectShow enumeration; returns None if pygrabber isn't available or the
-    device isn't present (e.g. OBS isn't running with Virtual Camera started)."""
-    try:
-        from pygrabber.dshow_graph import FilterGraph
-        names = FilterGraph().get_input_devices()
-    except Exception:
-        return None
+    name_hint (default the OBS Virtual Camera), or None.
+
+    Runs pygrabber's DirectShow enumeration in a DEDICATED short-lived thread that
+    does its own CoInitialize/CoUninitialize. This is required, not cosmetic: the
+    enumeration is COM (DirectShow), and in a long-lived process with other threads
+    touching COM (the GUI: tkinter main thread + the ALS rank-tracker daemon + the
+    watch worker thread), calling it on those threads intermittently returns None
+    even though the camera is present — which surfaced as "OBS Virtual Camera NOT
+    FOUND" in OBS mode. Isolating each call in a fresh STA apartment makes it
+    reliable regardless of what the rest of the process did with COM."""
     hint = name_hint.lower()
-    for i, n in enumerate(names):
-        if hint in (n or "").lower():
-            return i
-    return None
+    result = [None]
+
+    def _enum():
+        inited = False
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            inited = True
+        except Exception:
+            pass
+        try:
+            from pygrabber.dshow_graph import FilterGraph
+            names = FilterGraph().get_input_devices()
+            for i, n in enumerate(names):
+                if hint in (n or "").lower():
+                    result[0] = i
+                    break
+        except Exception:
+            pass
+        finally:
+            if inited:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
+
+    th = threading.Thread(target=_enum, daemon=True)
+    th.start()
+    th.join(timeout=8)
+    return result[0]
 
 
 class VideoDeviceCapture:
