@@ -52,7 +52,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -1012,7 +1012,7 @@ def append_match(path, match):
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
-def open_live_capture(cfg, throttle_override=None):
+def open_live_capture(cfg):
     """Open the live capture.
 
     mode "monitor" (default): capture the whole monitor Apex is on. This is the
@@ -1027,11 +1027,7 @@ def open_live_capture(cfg, throttle_override=None):
     """
     cap_cfg = cfg.get("capture", {})
     exe_names = cap_cfg.get("exe_names", ["r5apex_dx12.exe", "r5apex.exe"])
-    # throttle_override lets the on-demand summary-read open a FAST session on the
-    # static end screen (so the stability gate's confirming frame arrives sub-second)
-    # without changing the gameplay throttle. None = use the configured throttle_ms.
-    throttle = (throttle_override if throttle_override is not None
-                else cap_cfg.get("throttle_ms", 500))
+    throttle = cap_cfg.get("throttle_ms", 500)
     mode = cap_cfg.get("mode", "monitor")
     hwnd = find_window_hwnd(exe_names)
 
@@ -1275,39 +1271,30 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     if fp in seen or (sk and sk in seen):
         return "duplicate"
 
-    # Stability gate: only log once these exact stats are confirmed, so a
-    # mid-animation value (plausible but still rolling up) is never committed.
-    # Confirm by EITHER a genuinely newer capture frame reproducing the same
-    # fingerprint (the numbers stopped moving) OR — as a fallback when frames are
-    # sparse (high throttle_ms) — the same values holding for a short wall-clock
-    # window. Without the wall-clock fallback, a summary dismissed before the next
-    # (up to throttle_ms-spaced) frame arrives is read correctly and then thrown
-    # away; the fallback lets it commit after one extra poll instead.
+    # Stability gate: only log once these exact stats are confirmed by a NEWER
+    # capture frame, so mid-animation values (plausible but still rolling up — the
+    # summary slides/rolls in over a couple seconds) are never committed. The
+    # `frame_ts > stable["ft"]` check requires the confirmation to come from a
+    # genuinely new capture, not a re-read of the same cached frame — and with the
+    # capture throttle the two confirming reads are spaced far enough apart that
+    # the screen has finished animating by the second one. (This spacing is what
+    # kept reads reliable; a faster path here causes mis-read names/numbers.)
     if stable is not None:
-        now = time.time()
-        if fp != stable.get("fp"):
-            # New / changed read — (re)start the confirmation window.
+        confirmed = (fp == stable.get("fp") and frame_ts is not None
+                     and frame_ts > stable.get("ft", 0.0))
+        if not confirmed:
             stable["fp"] = fp
             stable["ft"] = frame_ts if frame_ts is not None else 0.0
-            stable["seen"] = now
-            return "incomplete"
-        fresh_frame = frame_ts is not None and frame_ts > stable.get("ft", 0.0)
-        if frame_ts is not None:
-            stable["ft"] = frame_ts
-        confirm_secs = cfg_eff.get("stability_confirm_seconds", 0.8)
-        if not (fresh_frame or (now - stable.get("seen", now)) >= confirm_secs):
             return "incomplete"
 
     match["ranked"] = ranked
-    # RP only makes sense for ranked matches. With detection disabled (ranked is
-    # None) we keep the original always-resolve behaviour. With it ENABLED, the
-    # HUD-badge detector can still miss a genuine ranked game (short match, early
-    # death, or a rank tier it wasn't calibrated on), which would silently blank
-    # that match's RP. So unless assume-zero is on — where skipping pubs is exactly
-    # what keeps a false 0 off them — we fail OPEN on an unconfirmed (False) flag:
-    # still snapshot + queue resolution. A true pub then simply never moves RP and
-    # stays blank (no harm), while a misdetected ranked game keeps its RP.
-    do_rp = bool(_RANK_TRACKER) and (ranked is not False or not _RANK_ASSUME_ZERO)
+    # RP only makes sense for ranked matches. With detection enabled we skip pubs
+    # outright (ranked is False); with it disabled (ranked is None) we keep the
+    # original always-resolve behaviour. Pubs MUST NOT resolve RP: a pub doesn't
+    # change RP, so the durable resolver would otherwise attribute a LATER ranked
+    # game's RP movement to the pub (and leave the ranked game blank). Only
+    # ranked / detection-off matches get a baseline + queued resolution.
+    do_rp = bool(_RANK_TRACKER) and ranked is not False
 
     # ── RP snapshot (starting_rp) ──
     # Grab each player's current RP from the rank tracker cache RIGHT NOW.
@@ -1729,8 +1716,16 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
             # an IsWindow() check (no expensive window scan), so it won't hitch.
             if time.time() - last_recheck > 30:
                 last_recheck = time.time()
-                alive = hwnd is not None and _user32.IsWindow(hwnd)
-                if not alive or cap.last_frame_age() > 20:
+                if cap_mode == "obs":
+                    # OBS reads a virtual camera, NOT the Apex window — so a missing
+                    # game window is normal (e.g. tracking on a separate stream PC
+                    # where the game isn't running). Re-acquire only when the feed
+                    # actually goes stale, never just because there's no hwnd.
+                    need_reacquire = cap.last_frame_age() > 20
+                else:
+                    alive = hwnd is not None and _user32.IsWindow(hwnd)
+                    need_reacquire = (not alive) or cap.last_frame_age() > 20
+                if need_reacquire:
                     cap.release()
                     cap, src, hwnd = open_live_capture(cfg)
                     status["src"] = src
@@ -1866,12 +1861,6 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
     summary by then, so a brief active capture is fine), then close and idle again.
     """
     idle_probe = cfg.get("capture", {}).get("idle_probe_seconds", 8)
-    # Open each probe FAST so that once a summary banner is caught and the session
-    # is held open, the stability gate's confirming frame arrives sub-second
-    # instead of waiting a full throttle_ms. The end screen is static (game idle),
-    # so capturing fast there adds no gameplay stutter; a gameplay probe only ever
-    # grabs one frame before releasing, so the throttle is irrelevant to it.
-    summary_throttle = cfg.get("capture", {}).get("summary_throttle_ms", 250)
     dbg = _make_debug_logger(cfg)
     dbg(f"on-demand watch started; idle_probe={idle_probe}s settle={settle_seconds}s "
         f"poll={poll}s csv={path}")
@@ -1898,7 +1887,7 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
     while not stop_event.is_set():
         probe_n += 1
         t_open = time.time()
-        cap, src, hwnd = open_live_capture(cfg, throttle_override=summary_throttle)
+        cap, src, hwnd = open_live_capture(cfg)
         status["src"] = src
         got = cap.wait_first(5)
         frame = cap.grab() if got else None

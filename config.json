@@ -21,9 +21,7 @@
     "on_demand": true,
     "idle_probe_seconds": 12,
     "_debug_log_help": "true = append timestamped lines to debug/tracker_debug.log for every capture probe (when it opens capture, what it saw, when it idled). Use it to line probes up against any stutter you felt in-game. Set false once tuned.",
-    "debug_log": true,
-    "_summary_throttle_help": "Frame-delivery cap (ms) used ONLY while a summary banner is detected and held open for reading. The end screen is static and the game is idle there, so capturing fast costs nothing and lets the stability gate confirm the stats within a fraction of a second instead of waiting a full throttle_ms - this is what stops a quickly-dismissed summary from being read but never committed. Does NOT affect gameplay capture (throttle_ms still governs that). Lower = faster commit; 250 is plenty.",
-    "summary_throttle_ms": 250
+    "debug_log": true
   },
   "_low_priority_help": "Run the tracker at below-normal process priority so Windows favors Apex. Recommended true.",
   "low_priority": true,
@@ -46,8 +44,6 @@
   "ranked_check_seconds": 25,
   "_settle_help": "Seconds to wait after the end-screen banner appears before reading it, so placement/stats are fully drawn (prevents blank/partial rows).",
   "settle_seconds": 1.5,
-  "_stability_confirm_help": "Seconds the SAME stats must hold before a summary commits, as a fallback when fresh capture frames are sparse (high throttle_ms). The gate normally confirms by seeing the numbers reproduce on a genuinely newer frame; this wall-clock backstop guarantees a fully-rendered, plausible summary still commits even if a new frame hasn't arrived yet - so a quickly-dismissed end screen isn't read and then thrown away. Keep small.",
-  "stability_confirm_seconds": 0.8,
   "_heartbeat_help": "Seconds between 'still watching' status lines so you can tell it's alive. Set 0 to disable.",
   "heartbeat_seconds": 60,
   "csv_path": "apex_matches.csv",
