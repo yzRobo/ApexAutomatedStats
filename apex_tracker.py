@@ -52,7 +52,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.3"
+__version__ = "1.5.4"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -108,29 +108,29 @@ _UPDATE_BAT = r'''@echo off
 setlocal enableextensions
 set "SRC={src}"
 set "DST={dst}"
-REM Wait for the app (PID {pid}) to fully exit so its files unlock.
-set /a n=0
-:wait
-tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
-if not errorlevel 1 (
-  set /a n+=1
-  if %n% LSS 150 ( ping -n 2 127.0.0.1 >nul & goto wait )
-)
-REM Copy the new _internal alongside the old one; only swap if it copied cleanly
-REM (robocopy returns < 8 on success).
-robocopy "%SRC%\_internal" "%DST%\_internal_new" /E /NFL /NDL /NJH /NJS /NP >nul
-if errorlevel 8 goto fail
+set "LOG=%DST%\_update_log.txt"
+>"%LOG%" echo [start] %date% %time%
+REM The app exits right after launching us; a fixed wait lets the running exe and
+REM its _internal DLLs unlock before we swap. (A PID-wait pipe proved unreliable
+REM when detached, so we use a simple timed wait instead.)
+ping -n 8 127.0.0.1 >nul
+>>"%LOG%" echo [copy _internal]
+robocopy "%SRC%\_internal" "%DST%\_internal_new" /E /R:4 /W:2 /NFL /NDL /NJH /NJS /NP >>"%LOG%" 2>&1
+if errorlevel 8 ( >>"%LOG%" echo [robocopy FAILED ec=%errorlevel%] & goto fail )
+>>"%LOG%" echo [swap files]
 if exist "%DST%\_internal_old" rmdir /s /q "%DST%\_internal_old"
-move "%DST%\_internal" "%DST%\_internal_old" >nul
-move "%DST%\_internal_new" "%DST%\_internal" >nul
-copy /y "%SRC%\ApexTracker.exe" "%DST%\ApexTracker.exe" >nul
-copy /y "%SRC%\ApexTrackerUI.exe" "%DST%\ApexTrackerUI.exe" >nul
+move "%DST%\_internal" "%DST%\_internal_old" >>"%LOG%" 2>&1
+move "%DST%\_internal_new" "%DST%\_internal" >>"%LOG%" 2>&1
+copy /y "%SRC%\ApexTracker.exe" "%DST%\ApexTracker.exe" >>"%LOG%" 2>&1
+copy /y "%SRC%\ApexTrackerUI.exe" "%DST%\ApexTrackerUI.exe" >>"%LOG%" 2>&1
 rmdir /s /q "%DST%\_internal_old" 2>nul
 rmdir /s /q "%DST%\_update_staging" 2>nul
+>>"%LOG%" echo [done; relaunching]
 start "" "%DST%\{ui}"
 del "%~f0"
 exit /b 0
 :fail
+>>"%LOG%" echo [restore + relaunch existing version]
 if exist "%DST%\_internal_new" rmdir /s /q "%DST%\_internal_new"
 if not exist "%DST%\_internal" if exist "%DST%\_internal_old" move "%DST%\_internal_old" "%DST%\_internal" >nul
 start "" "%DST%\{ui}"
@@ -184,13 +184,21 @@ def apply_update_and_restart(staging_dir):
     if not getattr(sys, "frozen", False) or not os.path.isdir(staging_dir):
         return False
     bat = os.path.join(HERE, "_apply_update.bat")
-    script = _UPDATE_BAT.format(pid=os.getpid(), src=staging_dir, dst=HERE,
-                                ui="ApexTrackerUI.exe")
+    script = _UPDATE_BAT.format(src=staging_dir, dst=HERE, ui="ApexTrackerUI.exe")
     with open(bat, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
         f.write(script)
+        f.flush()
+        os.fsync(f.fileno())
+    # Launch detached with explicit DEVNULL handles (a --noconsole app has no valid
+    # std handles to inherit) and a new process group, so the helper survives our
+    # exit and runs cleanly.
     DETACHED_PROCESS = 0x00000008
-    subprocess.Popen(["cmd", "/c", bat], creationflags=DETACHED_PROCESS,
-                     close_fds=True)
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    subprocess.Popen(["cmd", "/c", bat],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL,
+                     creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                     close_fds=True, cwd=HERE)
     return True
 
 # Initialize Supabase client if configured.
