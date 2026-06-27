@@ -52,7 +52,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.4"
+__version__ = "1.5.5"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -1836,6 +1836,16 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
                                 status=status, emit=emit, log_cb=log_cb,
                                 stop_event=stop_event)
 
+    # OBS mode reads a continuous virtual-camera feed with ZERO game overhead, so
+    # poll faster + settle shorter than the monitor/on-demand defaults to catch a
+    # quickly-dismissed summary (during a summary each loop runs OCR ~0.4s and then
+    # waited the full 1s poll, so reads landed ~1.5s apart — too slow). Reads stay
+    # correct: the stability gate still requires the SAME stats confirmed by a
+    # second fresh frame, so a mid-animation value is still rejected — we just
+    # check more often. Tunable via obs_poll_seconds / obs_settle_seconds.
+    if cap_mode == "obs":
+        poll = cfg.get("obs_poll_seconds", 0.3)
+
     dbg = _make_debug_logger(cfg)
     dbg(f"continuous watch started; mode={cap_mode} poll={poll}s csv={path}")
     cap, src, hwnd = open_live_capture(cfg)
@@ -1853,7 +1863,8 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     absent_since = None
     announced = False
     banner_logged = False
-    settle = cfg.get("settle_seconds", 1.5)
+    settle = (cfg.get("obs_settle_seconds", 0.8) if cap_mode == "obs"
+              else cfg.get("settle_seconds", 1.5))
     # Ranked-match detection (default off). During gameplay we throttle-check the
     # top-right HUD badge on frames the loop already grabbed (no extra capture) and
     # latch match_ranked for the match; two consecutive positives are required so a
