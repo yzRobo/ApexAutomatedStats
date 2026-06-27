@@ -52,7 +52,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.5"
+__version__ = "1.5.6"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -267,6 +267,9 @@ def _sync_ranks_to_supabase(snapshot):
 # side effects.
 _RANK_TRACKER = None
 _RANK_TRACKER_SIG = None  # (key, names, uids, poll) the live tracker was built for
+# Names already warned about being off-roster (in a ranked match but not in
+# known_names, so never RP-polled). Module-level so we warn once per process.
+_OFF_ROSTER_WARNED = set()
 # If a match's RP never moves within the window, assume rp_change=0 (a no-RP /
 # floor-protected loss) instead of null. Off by default (can't tell a genuine 0
 # from a non-ranked match or slow propagation). config "als_assume_zero_on_timeout".
@@ -1462,11 +1465,20 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     # BEFORE-match RP. The ending_rp is resolved later by the durable RP queue
     # (_enqueue_rp_pending -> the background sweep) once the EA cache updates.
     if do_rp:
+        known = set(cfg_eff.get("known_names") or [])
         for p in match["players"]:
             rp_now, _ = _RANK_TRACKER.get_rp(p["name"])
             p["starting_rp"] = rp_now
             p["ending_rp"] = None
             p["rp_change"] = None
+            # Off-roster guard: a player OCR'd in a ranked match but missing from
+            # known_names is never polled, so their RP silently never resolves
+            # (exactly how Rotarynerd got dropped). Surface it once per name.
+            if p["name"] and p["name"] not in known and p["name"] not in _OFF_ROSTER_WARNED:
+                _OFF_ROSTER_WARNED.add(p["name"])
+                print(f"[{datetime.now():%H:%M:%S}] WARNING: '{p['name']}' is in this "
+                      f"ranked match but NOT in your roster - their RP will NOT be "
+                      f"tracked. Add them (with their UID) in Settings to fix.")
     else:
         for p in match["players"]:
             p["starting_rp"] = None
@@ -2185,8 +2197,15 @@ def cmd_watch(forced_res=None):
             age = s.get("frame_age") or 0
             health = (f"capture OK ({age:.0f}s old frame)" if s["state"] == "watching"
                       else f"capture STALE ({age:.0f}s) - is Apex visible?")
-            print(f"[{datetime.now():%H:%M:%S}] still watching {s['src']} | {health} | "
-                  f"{s['logged_this_run']} logged this run")
+            line = (f"[{datetime.now():%H:%M:%S}] still watching {s['src']} | {health} | "
+                    f"{s['logged_this_run']} logged this run")
+            # Keep any untracked roster player visible: a name ALS can't resolve
+            # logs match stats but never gets RP, so remind every heartbeat.
+            if _RANK_TRACKER is not None:
+                missing = _RANK_TRACKER.unresolved_names()
+                if missing:
+                    line += f" | RP UNTRACKED: {', '.join(missing)} (not found on ALS)"
+            print(line)
 
     def log_cb(m):
         names = ", ".join(f"{p['name']}({p['kills']}k/{p['damage']}dmg)" for p in m["players"])

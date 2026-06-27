@@ -58,6 +58,18 @@ class RankTracker:
         self._uids = {str(k): str(v) for k, v in (uids or {}).items() if v}
         self._on_poll = on_poll
 
+        # Self-healing roster tracking:
+        #  - _ever_resolved: names that resolved on ALS at least once, so an
+        #    empty cache entry means "can't find this player", not "not polled".
+        #  - _notfound_counts: consecutive 404s per name (drives the warning).
+        #  - _warned: names already warned about, so we don't spam.
+        #  - _learned_uids: {name: uid} auto-discovered this session from a
+        #    successful name lookup (used to pin future polls to the UID).
+        self._ever_resolved = set()
+        self._notfound_counts = {}
+        self._warned = set()
+        self._learned_uids = {}
+
         # {name: {"current_rp": int|None, "previous_rp": int|None,
         #          "rank_name": str, "rank_div": int,
         #          "last_updated": float}}
@@ -87,6 +99,39 @@ class RankTracker:
         """Return a snapshot ``{name: {current_rp, previous_rp, ...}}``."""
         with self._lock:
             return {k: dict(v) for k, v in self._cache.items()}
+
+    def unresolved_names(self):
+        """Roster names that have NEVER resolved on ALS (misspelled, dropped,
+        or wrong platform). These players still log match stats via OCR but get
+        no RP; the watcher surfaces this so they aren't silently untracked."""
+        with self._lock:
+            return sorted(n for n in self._names
+                          if n not in self._ever_resolved
+                          and self._notfound_counts.get(n, 0) >= 2)
+
+    def learned_uids(self):
+        """``{name: uid}`` auto-discovered from successful name lookups this
+        session (so the caller can offer to persist them to config)."""
+        with self._lock:
+            return dict(self._learned_uids)
+
+    def _note_notfound(self, name):
+        """Record a 404 for *name* and warn ONCE if this roster name has never
+        resolved — so a misspelled/dropped player surfaces immediately instead
+        of silently logging match stats with no RP."""
+        with self._lock:
+            n = self._notfound_counts.get(name, 0) + 1
+            self._notfound_counts[name] = n
+            warn = (name not in self._ever_resolved
+                    and n >= 2 and name not in self._warned)
+            if warn:
+                self._warned.add(name)
+        _log(f"[RankTracker] {name}: 404 - player not found on {self._platform}")
+        if warn:
+            _log(f"[RankTracker] WARNING: '{name}' can't be found on ALS "
+                 f"({self._platform}) after {n} tries - check the exact in-game "
+                 f"spelling or add their UID in Settings; until then this "
+                 f"player's RP will NOT be tracked.")
 
     def force_poll_now(self):
         """Trigger an immediate poll cycle (runs on THIS thread).
@@ -178,6 +223,8 @@ class RankTracker:
             rp = _extract_rp(data)
             rank_name = _extract_rank_name(data)
             rank_div = _extract_rank_div(data)
+            learned_uid = _extract_uid(data)
+            newly_learned = None
             with self._lock:
                 prev = self._cache.get(name, {}).get("current_rp")
                 self._cache[name] = {
@@ -187,6 +234,19 @@ class RankTracker:
                     "rank_div": rank_div,
                     "last_updated": time.time(),
                 }
+                self._ever_resolved.add(name)
+                self._notfound_counts.pop(name, None)
+                self._warned.discard(name)
+                # Auto-upgrade name -> UID: once ALS hands us this player's UID,
+                # pin every future poll to it so we never depend on fragile name
+                # search again (the #1 cause of "RP randomly missing").
+                if learned_uid and name not in self._uids:
+                    self._uids[name] = learned_uid
+                    self._learned_uids[name] = learned_uid
+                    newly_learned = learned_uid
+            if newly_learned:
+                _log(f"[RankTracker] {name}: learned UID {newly_learned} "
+                     f"-> future polls use it (no more name search)")
             _log(f"[RankTracker] {name}: RP={rp}  rank={rank_name} div={rank_div}")
         except urllib.error.HTTPError as exc:
             code = exc.code
@@ -195,7 +255,7 @@ class RankTracker:
             elif code == 403:
                 _log(f"[RankTracker] {name}: 403 – bad API key or unauthorized")
             elif code == 404:
-                _log(f"[RankTracker] {name}: 404 – player not found on {self._platform}")
+                self._note_notfound(name)
             elif code == 429:
                 _log(f"[RankTracker] {name}: 429 – rate limit; backing off")
                 time.sleep(5.0)  # extra back-off
@@ -230,6 +290,16 @@ def _extract_rank_div(data):
         return int(data["global"]["rank"]["rankDiv"])
     except (KeyError, TypeError, ValueError):
         return 0
+
+
+def _extract_uid(data):
+    """``global.uid`` → str, or '' if absent. A non-empty value means ALS
+    found the player, so we can pin future polls to this stable id."""
+    try:
+        uid = data["global"]["uid"]
+    except (KeyError, TypeError):
+        return ""
+    return str(uid) if uid not in (None, "") else ""
 
 
 def _log(msg):

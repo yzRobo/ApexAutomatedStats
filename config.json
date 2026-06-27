@@ -66,7 +66,12 @@
   "name_match_cutoff": 0.8,
   "_als_uids_help": "Optional {name: uid} overrides for the ALS rank tracker. ALS can't always map an Apex display name to an account (notably Steam accounts), so list those players by UID here. PC/Steam = your SteamID64 (find it at apexlegendsstatus.com -> log in -> the number in your profile URL /profile/uid/PC/<uid>). Names not listed here are looked up by display name as usual.",
   "als_uids": {
-    "yzRobo": "76561198029301970"
+    "yzRobo": "76561198029301970",
+    "NameJFK": "2418528855",
+    "Rotarynerd": "2412637975",
+    "UltVaultHunter": "2570764742",
+    "TCremer22": "2258659853",
+    "SaWaii": "1002798376043"
   },
   "_resolution_help": "The regions below are measured at base_width x base_height (1920x1080) and auto-scale to whatever resolution is captured, which already covers any 16:9 res (1440p, 4K). force_resolution pins a profile key like '2560x1440' (run 'setup' to set it interactively, or pass --res); leave it empty to auto-detect each run. profiles holds per-resolution region sets for cases where pure scaling is slightly off - each profile carries its own base_width/base_height plus header/columns/rows/detect blocks measured at that native resolution, and is used as-is (no scaling) when its key matches. See CALIBRATION.md.",
   "force_resolution": "",
