@@ -128,17 +128,18 @@ SETTINGS_GROUPS = [
     ]),
     ("Ranked & RP", [
         ("ranked_detect_enabled", "bool", "Detect ranked vs pub matches",
-         "Read the top-right HUD rank badge during play to stamp each match as "
-         "ranked or pub. Run supabase_migration_ranked.sql before turning this on, "
-         "or Supabase will reject the new column."),
+         "Read the top-right HUD rank badge during play to hint each match as "
+         "ranked or pub. In RP v2 this is a resolve-time HINT, not a gate: RP is "
+         "collected for every match, and an observed RP change proves 'ranked' even "
+         "if the badge was missed. Run supabase_migration_ranked.sql before turning "
+         "this on, or Supabase will reject the new column."),
         ("ranked_check_seconds", "int", "Ranked check interval (seconds)",
          "Seconds between rank-badge checks during gameplay. 20-30 is plenty; the "
          "badge is on screen the whole match."),
-        ("als_assume_zero_on_timeout", "bool", "Assume 0 RP on timeout",
-         "If a match's RP never moves within 5 min, record 0 instead of leaving it "
-         "blank. Only safe once 'Detect ranked' is on (pubs are then skipped)."),
         ("rank_poll_seconds", "int", "ALS poll interval (seconds)",
-         "How often the ALS rank tracker queries each player's RP. Needs ALS_API_KEY."),
+         "How often the ALS rank tracker polls each player's RP into the ledger "
+         "(powers session RP + per-match resolution). 30 is a good default; EA's "
+         "~2-3 min cache bounds freshness. Needs ALS_API_KEY."),
     ]),
     ("Capture (advanced)", [
         ("capture.throttle_ms", "int", "Capture throttle (ms)",
@@ -272,7 +273,12 @@ class App:
         self.detail_lbl.pack(anchor="w", padx=10)
         self.last_lbl = ttk.Label(card, text="No matches logged yet this run.",
                                   foreground=TEXT, wraplength=470, justify="left")
-        self.last_lbl.pack(anchor="w", padx=10, pady=(3, 10))
+        self.last_lbl.pack(anchor="w", padx=10, pady=(3, 6))
+        # Per-player live rank + self-healing session RP (§4.3). Monospaced so the
+        # columns line up; populated from the watch heartbeat.
+        self.rp_lbl = ttk.Label(card, text="", foreground=MUTED,
+                                font=("Consolas", 9), justify="left")
+        self.rp_lbl.pack(anchor="w", padx=10, pady=(0, 10))
 
         # Controls - primary actions on top, secondary tools beneath, so the row
         # never overflows the window width.
@@ -577,6 +583,34 @@ class App:
             self.last_lbl.config(
                 text=f"Last [{lm['time']}]{tagtxt}  #{lm['placed']}  "
                      f"{lm['total_kills']} squad kills\n{who}")
+
+        # Per-player live rank + session RP (self-healing = end-of-night minus
+        # start-of-night RP). Shown while watching; blank otherwise.
+        prs = s.get("players_rp") or []
+        stuck = s.get("rp_stuck") or []
+        if watching and (prs or stuck):
+            lines = []
+            for pr in prs:
+                d = pr.get("session_delta")
+                sess = f"{d:+d}" if d is not None else "--"
+                tier = (pr.get("tier") or "?")[:4]
+                div = str(pr["div"]) if pr.get("div") else ""
+                rp = pr.get("rp")
+                rp_s = str(rp) if rp is not None else "--"
+                lines.append(f"{pr['name'][:14]:<14} {tier:<4}{div:<2} "
+                             f"{rp_s:>6} RP   session {sess}")
+            untracked = s.get("rp_untracked") or []
+            if untracked:
+                lines.append(f"RP untracked (not on ALS): {', '.join(untracked)}")
+            # Matches stuck in RP resolution past the warn threshold — abnormal.
+            for st in stuck:
+                start = st.get("starting_rp")
+                start_s = f"start {start}" if start is not None else "no baseline"
+                lines.append(f"! pending {st['name']}/{st['session_id']} "
+                             f"{st['age'] / 60:.0f}m ({start_s})")
+            self.rp_lbl.config(text="\n".join(lines))
+        else:
+            self.rp_lbl.config(text="")
 
         if self._update_result is not _UNSET:
             self._show_update_result(self._update_result)

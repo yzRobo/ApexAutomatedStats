@@ -39,6 +39,7 @@ except ImportError:
     create_client = None
 
 from rank_tracker import RankTracker
+from rp_resolver import resolve_rp
 
 import numpy as np
 import cv2
@@ -52,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.5.6"
+__version__ = "1.6.0"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -267,10 +268,6 @@ def _sync_ranks_to_supabase(snapshot):
 # side effects.
 _RANK_TRACKER = None
 _RANK_TRACKER_SIG = None  # (key, names, uids, poll) the live tracker was built for
-# If a match's RP never moves within the window, assume rp_change=0 (a no-RP /
-# floor-protected loss) instead of null. Off by default (can't tell a genuine 0
-# from a non-ranked match or slow propagation). config "als_assume_zero_on_timeout".
-_RANK_ASSUME_ZERO = False
 # Load .env once so the owner's ALS_API_KEY there is available as a FALLBACK to the
 # config.json key (which the Settings UI edits). Friends ship no ALS key in .env.
 if load_dotenv:
@@ -289,8 +286,7 @@ def init_rank_tracker(cfg):
     start so an API key / roster / UID entered in Settings applies on Stop->Start
     with no app restart. Idempotent: rebuilds only when those settings changed,
     and tears the tracker down if the key was cleared."""
-    global _RANK_TRACKER, _RANK_TRACKER_SIG, _RANK_ASSUME_ZERO
-    _RANK_ASSUME_ZERO = bool(cfg.get("als_assume_zero_on_timeout", False))
+    global _RANK_TRACKER, _RANK_TRACKER_SIG
     key = _resolve_als_key(cfg)
     if not key:
         if _RANK_TRACKER is not None:
@@ -302,7 +298,7 @@ def init_rank_tracker(cfg):
         return
     names = list(cfg.get("known_names", []))
     uids = dict(cfg.get("als_uids", {}) or {})
-    poll = cfg.get("rank_poll_seconds", 120)
+    poll = cfg.get("rank_poll_seconds", 30)
     sig = (key, tuple(names), tuple(sorted(uids.items())), poll)
     if _RANK_TRACKER is not None and sig == _RANK_TRACKER_SIG:
         return  # nothing relevant changed
@@ -312,9 +308,14 @@ def init_rank_tracker(cfg):
         except Exception:
             pass
     try:
-        _RANK_TRACKER = RankTracker(api_key=key, known_names=names,
-                                    poll_seconds=poll, uids=uids,
-                                    on_poll=_sync_ranks_to_supabase)
+        # The always-on RP ledger lives next to rp_pending.json (writable app dir,
+        # not the PyInstaller bundle). §4.1.
+        _RANK_TRACKER = RankTracker(
+            api_key=key, known_names=names, poll_seconds=poll, uids=uids,
+            on_poll=_sync_ranks_to_supabase,
+            ledger_path=os.path.join(HERE, "rp_ledger.jsonl"),
+            retention_days=cfg.get("rp_ledger_retention_days", 14),
+            reset_drop=cfg.get("rp_reset_drop", 800))
         _RANK_TRACKER_SIG = sig
         print(f"(ALS) Rank tracker started for {len(names)} players "
               f"(poll every {poll}s).")
@@ -1397,10 +1398,11 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     Omit both (calibrate/batch) to log immediately with no stability wait.
 
     ``ranked`` is the per-match latch from the HUD badge detector: True (ranked),
-    False (pub), or None (detection disabled / never sampled). It is stored on the
-    match and gates RP resolution — pubs skip the ALS polling entirely, which is
-    also what makes ``als_assume_zero_on_timeout`` safe to enable. When detection
-    is off (None) the prior always-resolve behaviour is preserved exactly."""
+    False (pub), or None (detection disabled / never sampled). In RP v2 it is
+    stored on the match and carried into the pending queue as a resolve-time HINT
+    (``ranked_hint``) — it no longer GATES RP collection: every match gets a
+    baseline + pending record, and the resolver classifies it from the ledger
+    later (an observed delta proves ranked even if the badge was missed)."""
     match = extract_match(frame, cfg_eff, scale)
     # Wait until every player is named, every stat field read, AND placement has
     # rendered, so we never log a half-drawn screen. Names + placement alone is
@@ -1448,13 +1450,13 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
             return "incomplete"
 
     match["ranked"] = ranked
-    # RP only makes sense for ranked matches. With detection enabled we skip pubs
-    # outright (ranked is False); with it disabled (ranked is None) we keep the
-    # original always-resolve behaviour. Pubs MUST NOT resolve RP: a pub doesn't
-    # change RP, so the durable resolver would otherwise attribute a LATER ranked
-    # game's RP movement to the pub (and leave the ranked game blank). Only
-    # ranked / detection-off matches get a baseline + queued resolution.
-    do_rp = bool(_RANK_TRACKER) and ranked is not False
+    # v2 (RP_TRACKING_V2_SPEC §4.2): collect RP evidence for EVERY logged match,
+    # pub or ranked. The badge verdict is now only a resolve-time HINT, never a
+    # gate — a badge false-negative on a real ranked game used to lose its RP
+    # forever. So whenever the rank tracker is running we snapshot a baseline and
+    # queue the match; the resolver classifies it later from the ledger (a nonzero
+    # delta proves ranked; a zero-confirmed pub simply resolves to null/ranked=false).
+    do_rp = bool(_RANK_TRACKER)
 
     # ── RP snapshot (starting_rp) ──
     # Grab each player's current RP from the rank tracker cache RIGHT NOW.
@@ -1511,7 +1513,7 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
 # window (the old per-match thread gave up at 300 s and died when the app
 # closed). Because the baseline is frozen at match-end, queuing the next game
 # immediately can't corrupt the previous match's RP. A record is:
-#   {"session_id","name","player_slot","starting_rp","ranked","csv_path",
+#   {"session_id","name","player_slot","starting_rp","ranked_hint","csv_path",
 #    "logged_epoch"}
 _RP_PENDING_LOCK = threading.Lock()
 _RP_RESOLVER_STARTED = False
@@ -1560,7 +1562,9 @@ def _enqueue_rp_pending(match, csv_path_str):
         "name": p["name"],
         "player_slot": p["player_slot"],
         "starting_rp": p["starting_rp"],
-        "ranked": match.get("ranked"),
+        # Resolve-time HINT (badge verdict), not a gate: True/False/None. The
+        # resolver overrides it when a nonzero delta proves the match was ranked.
+        "ranked_hint": match.get("ranked"),
         "csv_path": csv_path_str,
         "logged_epoch": now,
     } for p in match["players"] if p.get("starting_rp") is not None]
@@ -1599,11 +1603,18 @@ def _rp_resolver_loop():
 
 
 def _rp_resolve_sweep():
-    """One pass over the pending queue: refresh ALS for the players still
-    awaiting RP, then resolve each player's EARLIEST pending match in
-    chronological order so baseline chaining holds (match B starts where A
-    ended). Conservatively flags collapsed multi-game jumps instead of guessing,
-    and never caps a positive (a high-kill win can be +500+)."""
+    """One pass over the pending queue (RP_TRACKING_V2_SPEC §4.2).
+
+    Refresh ALS for the players still awaiting RP (which appends fresh readings to
+    the always-on ledger), then hand the pending records + the ledger observations
+    to the pure resolver (:func:`rp_resolver.resolve_rp`), which classifies each
+    player's EARLIEST pending match at resolve time: a nonzero delta proves ranked;
+    a zero confirmed over a full window is a genuine 0 (badge tiebreaks); collapsed
+    or reset-spanning gaps are flagged, never guessed. This impure wrapper only
+    does I/O — poll, load, apply patches, rewrite the durable queue.
+
+    The queue, locks, atomic writes and patchers are unchanged; only the
+    resolution *rules* moved into the tested pure function."""
     if _RANK_TRACKER is None:
         return
     with _RP_PENDING_LOCK:
@@ -1615,24 +1626,21 @@ def _rp_resolve_sweep():
     except Exception:
         cfg = {}
     loss_floor = cfg.get("rp_loss_floor", -100)
+    zero_polls = cfg.get("rp_zero_confirm_polls", 6)
+    zero_secs = cfg.get("rp_zero_confirm_seconds", 360)
     expiry_secs = cfg.get("rp_pending_expiry_hours", 24) * 3600
     now = time.time()
 
     fresh = [r for r in records if (now - r.get("logged_epoch", now)) < expiry_secs]
     for r in records:
-        if r in fresh:
-            continue
-        # Expired: RP never propagated within the window. assume-zero (opt-in)
-        # stamps a 0 (floor-protected loss); otherwise leave an honest blank.
-        if _RANK_ASSUME_ZERO and r.get("starting_rp") is not None:
-            _safe_patch_rp(r.get("csv_path"), r["session_id"],
-                           {r["name"]: {"ending_rp": r["starting_rp"], "rp_change": 0}})
-            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP unresolved (expired) for "
-                  f"{r['session_id']} / {r['name']}: recorded 0 (assume-zero on).")
-        else:
+        if r not in fresh:
+            # Expired: RP never propagated within the (generous) window. Leave an
+            # honest blank — assume-zero is deprecated (zero-confirm supersedes it).
             print(f"[{datetime.now():%H:%M:%S}] (ALS) RP expired unresolved for "
                   f"{r['session_id']} / {r['name']} (left blank).")
 
+    # Poll the players still awaiting RP so the ledger has a fresh reading; this
+    # is the only side effect that feeds new evidence to the resolver.
     names = sorted({r["name"] for r in fresh})
     if names:
         try:
@@ -1640,46 +1648,34 @@ def _rp_resolve_sweep():
         except Exception as exc:
             print(f"[{datetime.now():%H:%M:%S}] (ALS) RP poll error - {exc}")
 
-    resolved_keys = set()   # (session_id, name) -> drop from queue
-    rebaseline = {}         # (session_id, name) -> corrected starting_rp (chaining)
+    # Gather each pending player's ledger observations from just before their
+    # earliest pending match (a small margin catches the baseline-era reading and
+    # any reset marker) through now.
+    observations = {}
+    for name in names:
+        earliest = min(r.get("logged_epoch", now) for r in fresh if r["name"] == name)
+        observations[name] = _RANK_TRACKER.get_observations(name, earliest - 60)
 
-    by_name = {}
-    for r in fresh:
-        by_name.setdefault(r["name"], []).append(r)
+    actions = resolve_rp(fresh, observations, now, loss_floor=loss_floor,
+                         zero_confirm_polls=zero_polls, zero_confirm_seconds=zero_secs)
 
-    for name, recs in by_name.items():
-        current, _ = _RANK_TRACKER.get_rp(name)
-        if current is None:
-            continue  # ALS hasn't resolved this player yet — try next sweep
-        recs.sort(key=lambda r: r.get("logged_epoch", 0.0))
-        rec = recs[0]   # earliest unresolved match; later ones chain behind it
-        start = rec.get("starting_rp")
-        if start is None or current == start:
-            continue    # no movement yet
-        delta = current - start
-        key = (rec["session_id"], rec["name"])
-        if delta < loss_floor:
-            # A single ranked game can't lose this much, so this jump either
-            # collapsed two results into one ALS reading (two pending games) or
-            # spans an untracked game / cache glitch. Don't fabricate a split —
-            # leave this match's RP blank; the match row itself is untouched.
-            why = ("spans multiple pending games" if len(recs) >= 2
-                   else "exceeds a single-game loss (untracked game or glitch)")
-            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP ambiguous for "
-                  f"{rec['session_id']} / {name}: observed {delta:+d} {why}; "
-                  f"left blank (no fabricated split).")
-            resolved_keys.add(key)
-        else:
-            _safe_patch_rp(rec.get("csv_path"), rec["session_id"],
-                           {name: {"ending_rp": current, "rp_change": delta}})
-            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP resolved for "
-                  f"{rec['session_id']} / {name}: {delta:+d} (now {current}).")
-            resolved_keys.add(key)
-        # Chain: the next pending match for this player starts where this one's
-        # observed value now sits (whether we attributed it or flagged it).
-        if len(recs) >= 2:
-            nxt = recs[1]
-            rebaseline[(nxt["session_id"], nxt["name"])] = current
+    for patch in actions.patches:
+        _safe_patch_rp(patch.get("csv_path"), patch["session_id"],
+                       {patch["name"]: patch["set"]})
+        cols = patch["set"]
+        print(f"[{datetime.now():%H:%M:%S}] (ALS) RP resolved for "
+              f"{patch['session_id']} / {patch['name']}: {cols}.")
+    for note in actions.notes:
+        print(f"[{datetime.now():%H:%M:%S}] (ALS) {note}")
+    # Propagation latency (first_changed_ts - logged_epoch) — the tuning
+    # instrument for cadence/windows (§4.2). Debug-level; only if enabled.
+    if actions.latencies and cfg.get("capture", {}).get("debug_log"):
+        dbg = _make_debug_logger(cfg)
+        for sid, name, secs in actions.latencies:
+            dbg(f"RP propagation latency {sid}/{name}: {secs:.0f}s")
+
+    resolved_keys = set(actions.resolved)
+    rebaseline = {k: v for k, v in actions.rebaselines.items()}
 
     # Reconcile under the lock (a concurrent enqueue may have appended): drop
     # resolved + expired, apply chained baselines, keep everything else.
@@ -1714,10 +1710,12 @@ def _safe_patch_rp(csv_path_str, session_id, resolved):
 
 
 def _patch_rp_in_csv(csv_path_str, session_id, resolved):
-    """Re-read the CSV, update matching rows with ending_rp / rp_change, rewrite.
+    """Re-read the CSV, update matching rows, rewrite.
 
-    *resolved* is ``{name: {"ending_rp": int, "rp_change": int}}``.  Only rows
-    whose ``session_id`` matches are touched.
+    *resolved* is ``{name: {col: val}}`` where ``col`` is any of ``ending_rp`` /
+    ``rp_change`` / ``ranked`` — only the columns present are written, so a real
+    value is never overwritten with a fabricated one. Only rows whose
+    ``session_id`` matches are touched.
     """
     if not os.path.exists(csv_path_str):
         return
@@ -1737,9 +1735,8 @@ def _patch_rp_in_csv(csv_path_str, session_id, resolved):
         for row in rows:
             row.pop(None, None)  # defensive: drop any ragged extra-value restkey
             if row.get("session_id") == session_id and row.get("name") in resolved:
-                rp_data = resolved[row["name"]]
-                row["ending_rp"] = rp_data["ending_rp"]
-                row["rp_change"] = rp_data["rp_change"]
+                for col, val in resolved[row["name"]].items():
+                    row[col] = val
                 changed = True
         if not changed:
             return
@@ -1761,20 +1758,89 @@ def _patch_rp_in_csv(csv_path_str, session_id, resolved):
 
 
 def _patch_rp_in_supabase(session_id, resolved):
-    """Update Supabase rows with the resolved ending_rp and rp_change.
+    """Update Supabase rows with the resolved columns.
 
-    *resolved* is ``{name: {"ending_rp": int, "rp_change": int}}``.
+    *resolved* is ``{name: {col: val}}`` where ``col`` is any of ``ending_rp`` /
+    ``rp_change`` / ``ranked``; only the present columns are written. The resolver
+    may now flip ``ranked`` async (a delta proving a match was ranked), exactly
+    like ``rp_change`` — the dashboard's dedupeRows already coalesces both.
     """
     if not _SUPABASE_CLIENT:
         return
-    for name, rp_data in resolved.items():
+    for name, cols in resolved.items():
+        if not cols:
+            continue
         try:
-            _SUPABASE_CLIENT.table("apex_matches").update({
-                "ending_rp": rp_data["ending_rp"],
-                "rp_change": rp_data["rp_change"],
-            }).eq("session_id", session_id).eq("name", name).execute()
+            _SUPABASE_CLIENT.table("apex_matches").update(dict(cols)) \
+                .eq("session_id", session_id).eq("name", name).execute()
         except Exception as e:
+            # Friend builds patch on the scoped anon key. Until
+            # supabase_migration_rp_v2.sql extends that grant to `ranked`, an
+            # update including `ranked` is rejected — retry without it so the
+            # RP columns still land (the flag stays until the migration runs).
+            retry = {k: v for k, v in cols.items() if k != "ranked"}
+            if "ranked" in cols and retry:
+                try:
+                    _SUPABASE_CLIENT.table("apex_matches").update(retry) \
+                        .eq("session_id", session_id).eq("name", name).execute()
+                    print(f"[{datetime.now():%H:%M:%S}] (Supabase) RP patch for {name} "
+                          f"synced WITHOUT 'ranked' - run supabase_migration_rp_v2.sql "
+                          f"to let the resolver update the ranked flag.")
+                    continue
+                except Exception as e2:
+                    e = e2
             print(f"[{datetime.now():%H:%M:%S}] (Supabase) RP patch error for {name}: {e}")
+
+
+def _rank_status_lines():
+    """Per-player live rank + session RP for the status panel / heartbeat (§4.3).
+
+    Returns ``[{name, rp, tier, div, session_delta}, ...]`` in roster (poll) order.
+    ``session_delta`` is the self-healing ``latest − session_baseline`` number
+    (TAS parity), None until the player has a reading this session. Empty list
+    when no rank tracker is running."""
+    if _RANK_TRACKER is None:
+        return []
+    lines = []
+    for name, e in _RANK_TRACKER.get_all().items():
+        delta, _, _ = _RANK_TRACKER.get_session_delta(name)
+        lines.append({
+            "name": name,
+            "rp": e.get("current_rp"),
+            "tier": e.get("rank_name"),
+            "div": e.get("rank_div"),
+            "session_delta": delta,
+        })
+    return lines
+
+
+def _pending_status_lines(warn_secs, now=None):
+    """Pending RP records unresolved longer than *warn_secs* — a real-time signal
+    that a match is stuck in an abnormal state.
+
+    600s (default) clears the legitimate slow path (zero-confirm floor ~360s + EA's
+    ~2-3 min cache), so a line here means something genuinely off (ALS never moved,
+    a player unresolvable, a collapse/reset still churning). Returns
+    ``[{name, session_id, age, starting_rp}, ...]``; empty when warn_secs<=0."""
+    if not warn_secs or warn_secs <= 0:
+        return []
+    now = now if now is not None else time.time()
+    with _RP_PENDING_LOCK:
+        try:
+            records = _load_rp_pending()
+        except Exception:
+            records = []
+    stuck = []
+    for r in records:
+        age = now - r.get("logged_epoch", now)
+        if age >= warn_secs:
+            stuck.append({
+                "name": r.get("name"),
+                "session_id": r.get("session_id"),
+                "age": age,
+                "starting_rp": r.get("starting_rp"),
+            })
+    return stuck
 
 
 def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None):
@@ -1795,6 +1861,10 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     # entered in Settings applies now (Stop->Start) without an app restart, then
     # resume resolving any RP left pending from a previous session (durable queue).
     init_rank_tracker(cfg)
+    # A session = this watch run (Start→Stop). Anchor the session-RP baseline now,
+    # even if the tracker object was reused across a Stop→Start (§4.3).
+    if _RANK_TRACKER is not None:
+        _RANK_TRACKER.set_session_start(time.time())
     _ensure_rp_resolver()
     forced = forced_res or cfg.get("force_resolution") or None
     path = csv_path(cfg)
@@ -1811,7 +1881,9 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
               "logged_this_run": 0,
               "already_logged": sum(1 for k in seen if k.startswith("stat:")),
               "last_match": None, "csv_path": path, "resolution": None,
-              "profile": None, "match_ranked": False, "event": "start"}
+              "profile": None, "match_ranked": False, "event": "start",
+              # Per-player live rank + session RP (§4.3); refreshed on heartbeat.
+              "players_rp": [], "rp_untracked": [], "rp_stuck": []}
 
     def emit(event):
         status["event"] = event
@@ -1905,6 +1977,11 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
             # Heartbeat tick so a front-end can show it is alive and capturing.
             if hb_secs and time.time() - last_hb >= hb_secs:
                 last_hb = time.time()
+                status["players_rp"] = _rank_status_lines()          # §4.3
+                status["rp_untracked"] = (_RANK_TRACKER.unresolved_names()
+                                          if _RANK_TRACKER is not None else [])
+                status["rp_stuck"] = _pending_status_lines(
+                    cfg.get("rp_pending_warn_seconds", 600))
                 emit("heartbeat")
             else:
                 emit("tick")
@@ -2050,6 +2127,11 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
         nonlocal last_hb
         if hb_secs and time.time() - last_hb >= hb_secs:
             last_hb = time.time()
+            status["players_rp"] = _rank_status_lines()          # §4.3
+            status["rp_untracked"] = (_RANK_TRACKER.unresolved_names()
+                                      if _RANK_TRACKER is not None else [])
+            status["rp_stuck"] = _pending_status_lines(
+                cfg.get("rp_pending_warn_seconds", 600))
             emit("heartbeat")
         else:
             emit("tick")
@@ -2189,11 +2271,25 @@ def cmd_watch(forced_res=None):
                     f"{s['logged_this_run']} logged this run")
             # Keep any untracked roster player visible: a name ALS can't resolve
             # logs match stats but never gets RP, so remind every heartbeat.
-            if _RANK_TRACKER is not None:
-                missing = _RANK_TRACKER.unresolved_names()
-                if missing:
-                    line += f" | RP UNTRACKED: {', '.join(missing)} (not found on ALS)"
+            missing = s.get("rp_untracked") or []
+            if missing:
+                line += f" | RP UNTRACKED: {', '.join(missing)} (not found on ALS)"
             print(line)
+            # Per-player live rank + self-healing session RP (§4.3).
+            for pr in s.get("players_rp", []):
+                d = pr.get("session_delta")
+                sess = f"session {d:+d}" if d is not None else "session --"
+                tier = pr.get("tier") or "?"
+                div = f" {pr['div']}" if pr.get("div") else ""
+                rp = pr.get("rp")
+                rp_s = f"{rp} RP" if rp is not None else "RP --"
+                print(f"    {pr['name']:<16} {tier}{div}  {rp_s}  {sess}")
+            # Matches stuck in RP resolution past the warn threshold — abnormal.
+            for st in s.get("rp_stuck", []):
+                start = st.get("starting_rp")
+                start_s = f"start RP {start}" if start is not None else "no baseline"
+                print(f"    ! RP still pending: {st['name']} / {st['session_id']} "
+                      f"- {st['age'] / 60:.0f} min unresolved ({start_s})")
 
     def log_cb(m):
         names = ", ".join(f"{p['name']}({p['kills']}k/{p['damage']}dmg)" for p in m["players"])

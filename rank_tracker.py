@@ -10,15 +10,47 @@ See ALS_RP_TRACKER_SPEC.md for the full design rationale.
 """
 
 import json
+import os
 import threading
 import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from collections import deque
 from datetime import datetime
 
 
 _ALS_BRIDGE = "https://api.apexlegendsstatus.com/bridge"
+
+# Per-player in-memory ledger ring buffer size. At the 30s default cadence this
+# holds ~16h of readings, plenty for a session delta and the resolver's windows;
+# the durable history lives in the on-disk ledger regardless.
+_LEDGER_RING = 2000
+# Rotate the ledger file once it grows past this on startup (keeps one backup).
+_LEDGER_MAX_BYTES = 10 * 1024 * 1024
+
+# Serializes ALL ledger FILE I/O across RankTracker instances. A reconfigure
+# (Stop->Start with changed roster/key) builds a new tracker on the SAME ledger
+# path while the old daemon may still fire one final append; a module-wide lock
+# (not the per-instance _ledger_lock) keeps that append from racing the new
+# instance's startup rotate/hydrate of the identical file.
+_LEDGER_FILE_LOCK = threading.Lock()
+
+# Rank tiers low→high, for detecting a season reset (a large RP drop *alongside* a
+# tier drop). Matched by lowercase prefix against ALS ``rankName``.
+_TIER_ORDER = ["rookie", "bronze", "silver", "gold", "platinum",
+               "diamond", "master", "apex predator"]
+
+
+def _tier_index(tier):
+    """Index of *tier* in :data:`_TIER_ORDER` (higher = better), or -1 if unknown."""
+    if not tier:
+        return -1
+    t = str(tier).strip().lower()
+    for i, name in enumerate(_TIER_ORDER):
+        if t.startswith(name):
+            return i
+    return -1
 
 
 class RankTracker:
@@ -44,10 +76,24 @@ class RankTracker:
         shape as :meth:`get_all`). Used to persist the live rank snapshot (e.g.
         upsert to Supabase) so the dashboard can show current rank/RP without a
         match. Exceptions in the callback are swallowed so polling never breaks.
+    ledger_path : str | None
+        Path to the durable JSONL RP ledger (``rp_ledger.jsonl``, next to
+        ``rp_pending.json``). Every successful reading is appended here and mirrored
+        into an in-memory ring buffer; :meth:`get_observations` and
+        :meth:`get_session_delta` read it. None disables on-disk persistence (the
+        ring buffer still works) — used by unit tests.
+    retention_days : int
+        On startup, rotate the ledger to ``rp_ledger.1.jsonl`` if it is older than
+        this or exceeds ~10 MB (one generation kept).
+    reset_drop : int
+        An RP drop larger than this in one step, alongside a tier drop, marks a
+        season-reset discontinuity (``"reset": true``) that consumers must not
+        compute deltas across. A ``rankedSeason`` change also marks a reset.
     """
 
-    def __init__(self, api_key, known_names, poll_seconds=120, platform="PC",
-                 uids=None, on_poll=None):
+    def __init__(self, api_key, known_names, poll_seconds=30, platform="PC",
+                 uids=None, on_poll=None, ledger_path=None,
+                 retention_days=14, reset_drop=800):
         self._api_key = api_key
         self._names = list(known_names)
         self._poll_seconds = max(10, poll_seconds)
@@ -57,6 +103,28 @@ class RankTracker:
         # (e.g. a SteamID64) instead of by name. Keys/values coerced to str.
         self._uids = {str(k): str(v) for k, v in (uids or {}).items() if v}
         self._on_poll = on_poll
+
+        # --- Always-on RP ledger (RP_TRACKING_V2_SPEC.md §4.1) --------------- #
+        # Every successful reading is appended to a durable JSONL ledger AND to a
+        # per-player in-memory ring buffer. Session RP (latest − session baseline)
+        # and the resolver's per-match classification both read from this ledger;
+        # it is the self-healing, TAS-parity source of truth. Absent ledger_path
+        # (e.g. a unit test) disables persistence but keeps the ring buffer.
+        self._ledger_path = ledger_path
+        self._reset_drop = reset_drop
+        self._ledger_lock = threading.Lock()
+        # {name: deque[{"ts", "rp", "reset"}]} — readers hold _ledger_lock.
+        self._obs = {}
+        # Per-name last-seen season / rp / tier for reset detection across reads
+        # (and across restarts, seeded from the hydrated ledger).
+        self._last_season = {}
+        self._last_rp = {}
+        self._last_tier = {}
+        # Session = one watch run; the baseline is the first reading after this.
+        self._session_start = time.time()
+        if self._ledger_path:
+            self._rotate_ledger(retention_days)
+            self._hydrate_ledger()
 
         # Self-healing roster tracking:
         #  - _ever_resolved: names that resolved on ALS at least once, so an
@@ -114,6 +182,53 @@ class RankTracker:
         session (so the caller can offer to persist them to config)."""
         with self._lock:
             return dict(self._learned_uids)
+
+    # ------------------------------------------------------------------ #
+    # RP ledger (§4.1) — session delta + resolver evidence
+    # ------------------------------------------------------------------ #
+    def set_session_start(self, epoch):
+        """Mark the start of a watch run. Each player's session baseline is the
+        first successful reading at/after this instant, so Start→Stop→Start begins
+        a fresh session (the durable ledger keeps continuity for the resolver)."""
+        with self._ledger_lock:
+            self._session_start = float(epoch)
+
+    def get_observations(self, name, since_epoch=0.0):
+        """Ledger readings for *name* at ``ts >= since_epoch``, oldest first.
+
+        Served from the in-memory ring buffer (hydrated from the ledger file at
+        startup, so restarts keep history). Each entry is a copy of
+        ``{"ts", "rp", "reset"}`` — the evidence the resolver classifies against.
+        """
+        with self._ledger_lock:
+            ring = self._obs.get(name)
+            if not ring:
+                return []
+            return [dict(o) for o in ring if o["ts"] >= since_epoch]
+
+    def get_session_delta(self, name):
+        """``(delta, baseline_ts, latest_ts)`` for *name* this session, or
+        ``(None, None, None)`` if there is no reading yet.
+
+        ``delta = latest.rp − baseline.rp`` where baseline is the first reading
+        after the session start — re-anchored to the most recent reset within the
+        session so a season rollover never poisons the number. This is the
+        self-healing, always-correct session RP (TAS parity): any stale or missed
+        reading is corrected by the next one, errors never accumulate."""
+        with self._ledger_lock:
+            ring = self._obs.get(name)
+            sess = self._session_start
+            if not ring:
+                return None, None, None
+            in_session = [o for o in ring if o["ts"] >= sess]
+            if not in_session:
+                return None, None, None
+            baseline = in_session[0]
+            for o in in_session:
+                if o["reset"]:
+                    baseline = o  # re-anchor past a reset
+            latest = in_session[-1]
+            return latest["rp"] - baseline["rp"], baseline["ts"], latest["ts"]
 
     def _note_notfound(self, name):
         """Record a 404 for *name* and warn ONCE if this roster name has never
@@ -224,6 +339,8 @@ class RankTracker:
             rank_name = _extract_rank_name(data)
             rank_div = _extract_rank_div(data)
             learned_uid = _extract_uid(data)
+            season = _extract_season(data)
+            state, in_game = _extract_realtime(data)
             newly_learned = None
             with self._lock:
                 prev = self._cache.get(name, {}).get("current_rp")
@@ -232,6 +349,9 @@ class RankTracker:
                     "previous_rp": prev,
                     "rank_name": rank_name,
                     "rank_div": rank_div,
+                    "season": season,
+                    "state": state,
+                    "in_game": in_game,
                     "last_updated": time.time(),
                 }
                 self._ever_resolved.add(name)
@@ -244,6 +364,11 @@ class RankTracker:
                     self._uids[name] = learned_uid
                     self._learned_uids[name] = learned_uid
                     newly_learned = learned_uid
+            # Append to the always-on RP ledger (§4.1). Only readings with a real
+            # rankScore are useful for deltas, so skip a None rp.
+            if rp is not None:
+                self._append_observation(name, self._uids.get(name), rp,
+                                         rank_name, rank_div, season, state, in_game)
             if newly_learned:
                 _log(f"[RankTracker] {name}: learned UID {newly_learned} "
                      f"-> future polls use it (no more name search)")
@@ -263,6 +388,125 @@ class RankTracker:
                 _log(f"[RankTracker] {name}: HTTP {code}")
         except Exception as exc:
             _log(f"[RankTracker] {name}: error – {exc}")
+
+    # ------------------------------------------------------------------ #
+    # Ledger internals
+    # ------------------------------------------------------------------ #
+    def _append_observation(self, name, uid, rp, tier, div, season, state, in_game):
+        """Record one reading in the on-disk ledger and the in-memory ring.
+
+        Flags a discontinuity (``"reset": true``) when the ranked season changes,
+        or RP drops by more than ``reset_drop`` in one step alongside a tier drop —
+        so a season rollover can't be misread as a huge match loss. Single writer
+        (the poll thread); readers hold ``_ledger_lock``."""
+        prev_season = self._last_season.get(name)
+        prev_rp = self._last_rp.get(name)
+        prev_tier = self._last_tier.get(name)
+
+        season_changed = (prev_season is not None and season is not None
+                          and season != prev_season)
+        big_drop = (prev_rp is not None and (prev_rp - rp) > self._reset_drop)
+        tier_dropped = _tier_index(tier) < _tier_index(prev_tier)
+        # If either tier is unknown we can't confirm a tier drop, so a big drop
+        # alone (which no single game can produce) is treated as a reset.
+        tier_unknown = _tier_index(tier) < 0 or _tier_index(prev_tier) < 0
+        reset = bool(season_changed or (big_drop and (tier_dropped or tier_unknown)))
+
+        entry = {"ts": time.time(), "rp": rp, "reset": reset}
+        line = None
+        # Ring + reset-detection state are per-instance (own lock).
+        with self._ledger_lock:
+            ring = self._obs.get(name)
+            if ring is None:
+                ring = self._obs[name] = deque(maxlen=_LEDGER_RING)
+            ring.append(entry)
+            self._last_season[name] = season if season is not None else prev_season
+            self._last_rp[name] = rp
+            self._last_tier[name] = tier if tier else prev_tier
+            if self._ledger_path:
+                line = json.dumps({
+                    "ts": entry["ts"], "name": name, "uid": uid, "rp": rp,
+                    "tier": tier or None, "div": div if div else None,
+                    "season": season, "state": state, "in_game": in_game,
+                    **({"reset": True} if reset else {}),
+                })
+        # File append is under the SHARED lock (serializes vs a sibling instance's
+        # rotate/hydrate), separate from the per-instance lock above (no nesting).
+        if line is not None:
+            with _LEDGER_FILE_LOCK:
+                try:
+                    with open(self._ledger_path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except OSError as exc:
+                    _log(f"[RankTracker] ledger write failed – {exc}")
+        if reset:
+            _log(f"[RankTracker] {name}: RP reset detected (season/tier rollover) "
+                 f"-> ledger discontinuity marked.")
+
+    def _rotate_ledger(self, retention_days):
+        """On startup, roll the ledger to ``rp_ledger.1.jsonl`` if it exceeds
+        ~10 MB or is older than *retention_days* (one generation kept)."""
+        path = self._ledger_path
+        if not path or not os.path.exists(path):
+            return
+        with _LEDGER_FILE_LOCK:  # serialize vs a sibling instance's append/hydrate
+            try:
+                too_big = os.path.getsize(path) > _LEDGER_MAX_BYTES
+                too_old = (time.time() - os.path.getmtime(path)) > retention_days * 86400
+            except OSError:
+                return
+            if not (too_big or too_old):
+                return
+            backup = path[:-6] + ".1.jsonl" if path.endswith(".jsonl") else path + ".1"
+            try:
+                if os.path.exists(backup):
+                    os.remove(backup)
+                os.replace(path, backup)
+                _log(f"[RankTracker] rotated RP ledger -> {os.path.basename(backup)} "
+                     f"({'size' if too_big else 'age'} threshold).")
+            except OSError as exc:
+                _log(f"[RankTracker] ledger rotation skipped – {exc}")
+
+    def _hydrate_ledger(self):
+        """Load the on-disk ledger into the per-player ring buffers at startup so
+        restarts keep session/resolver history. Tolerant of partial/last-line
+        corruption (a kill mid-write): bad lines are skipped."""
+        path = self._ledger_path
+        if not path or not os.path.exists(path):
+            return
+        loaded = 0
+        try:
+            with _LEDGER_FILE_LOCK, open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                        ts = float(d["ts"])
+                        rp = int(d["rp"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    name = d.get("name")
+                    if not name:
+                        continue
+                    ring = self._obs.get(name)
+                    if ring is None:
+                        ring = self._obs[name] = deque(maxlen=_LEDGER_RING)
+                    ring.append({"ts": ts, "rp": rp, "reset": bool(d.get("reset"))})
+                    # Seed reset-detection state so it continues across the restart.
+                    self._last_rp[name] = rp
+                    if d.get("season") is not None:
+                        self._last_season[name] = d.get("season")
+                    if d.get("tier"):
+                        self._last_tier[name] = d.get("tier")
+                    loaded += 1
+        except OSError as exc:
+            _log(f"[RankTracker] ledger hydrate skipped – {exc}")
+            return
+        if loaded:
+            _log(f"[RankTracker] hydrated {loaded} RP ledger readings "
+                 f"for {len(self._obs)} players.")
 
 
 # ---------------------------------------------------------------------- #
@@ -300,6 +544,35 @@ def _extract_uid(data):
     except (KeyError, TypeError):
         return ""
     return str(uid) if uid not in (None, "") else ""
+
+
+def _extract_season(data):
+    """``global.rank.rankedSeason`` → str, or None. Present only on some keys;
+    used to detect a season rollover (a ledger reset boundary)."""
+    try:
+        s = data["global"]["rank"].get("rankedSeason")
+    except (KeyError, TypeError, AttributeError):
+        return None
+    return str(s) if s not in (None, "") else None
+
+
+def _extract_realtime(data):
+    """The bridge ``realtime`` block → ``(currentState, isInGame)``.
+
+    Server-side presence (a per-player match-boundary signal, no OCR). Only a
+    *signal* — EA privacy settings can hide it — so tolerate absence gracefully.
+    Returns ``(None, None)`` when the block is missing."""
+    try:
+        rt = data.get("realtime") or {}
+    except AttributeError:
+        return None, None
+    state = rt.get("currentState")
+    in_game = rt.get("isInGame")
+    # ALS encodes isInGame as 0/1 in some responses; coerce to a clean bool/None.
+    if isinstance(in_game, (int, float)):
+        in_game = bool(in_game)
+    return (str(state) if state not in (None, "") else None,
+            in_game if isinstance(in_game, bool) else None)
 
 
 def _log(msg):
