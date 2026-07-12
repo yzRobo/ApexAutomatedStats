@@ -201,8 +201,12 @@ class App:
         self._dirty = False  # unsaved settings changes
 
         root.title(f"Apex Tracker  v{core.__version__}")
-        root.geometry("560x880")
-        root.minsize(540, 760)
+        # Fit the window to the screen so its bottom (the footer + update button)
+        # is never pushed off a short display or by DPI scaling; the body scrolls
+        # for anything taller. minsize stays small so it works on short screens.
+        _sh = root.winfo_screenheight()
+        root.geometry(f"560x{min(880, max(560, _sh - 96))}")
+        root.minsize(500, 520)
         self.bg = BG  # real themed bg is resolved in _apply_theme
         self._apply_theme()
         self._build()
@@ -246,8 +250,33 @@ class App:
     def _build(self):
         pad = {"padx": 12, "pady": 5}
 
+        # Scrollable body: the window can be shorter than its content (short
+        # screens, DPI scaling, a tall status panel with everyone's session RP),
+        # so wrap everything in a canvas + scrollbar. Without this the footer /
+        # "Check for updates" button gets pushed off the bottom with no way to
+        # reach it. Every top-level section below packs into `container`.
+        shell = ttk.Frame(self.root)
+        shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(shell, bg=self.bg, highlightthickness=0)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        vsb.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=vsb.set)
+        container = ttk.Frame(canvas)
+        cwin = canvas.create_window((0, 0), window=container, anchor="nw")
+        container.bind("<Configure>",
+                       lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(cwin, width=e.width))
+        # Scope the mousewheel to when the pointer is over the body so it doesn't
+        # fight the settings dialog's own wheel binding.
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>",
+            lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
         # Header
-        head = ttk.Frame(self.root)
+        head = ttk.Frame(container)
         head.pack(fill="x", padx=12, pady=(12, 4))
         ttk.Label(head, text="Apex Damage / Kill Tracker",
                   style="Title.TLabel").pack(side="left")
@@ -255,7 +284,7 @@ class App:
                   style="Muted.TLabel").pack(side="right", pady=(8, 0))
 
         # Status card
-        card = ttk.LabelFrame(self.root, text="STATUS")
+        card = ttk.LabelFrame(container, text="STATUS")
         card.pack(fill="x", **pad)
         row = ttk.Frame(card)
         row.pack(fill="x", padx=10, pady=(8, 4))
@@ -282,7 +311,7 @@ class App:
 
         # Controls - primary actions on top, secondary tools beneath, so the row
         # never overflows the window width.
-        ctrl = ttk.Frame(self.root)
+        ctrl = ttk.Frame(container)
         ctrl.pack(fill="x", **pad)
         self.start_btn = ttk.Button(ctrl, text="Start", command=self.start,
                                     style="Accent.TButton")
@@ -294,14 +323,14 @@ class App:
         ttk.Button(ctrl, text="Dashboard",
                    command=self.open_dashboard).pack(side="right", padx=6)
 
-        tools = ttk.Frame(self.root)
+        tools = ttk.Frame(container)
         tools.pack(fill="x", padx=12)
         ttk.Button(tools, text="Open CSV", command=self.open_csv).pack(side="left")
         self.shot_btn = ttk.Button(tools, text="Capture frame", command=self.capture_frame)
         self.shot_btn.pack(side="left", padx=6)
 
         # Settings
-        sett = ttk.LabelFrame(self.root, text="QUICK SETTINGS")
+        sett = ttk.LabelFrame(container, text="QUICK SETTINGS")
         sett.pack(fill="both", expand=True, **pad)
 
         ttk.Label(sett, text="Squad roster",
@@ -415,7 +444,7 @@ class App:
         self.save_note.pack(side="left", padx=8)
 
         # Footer: update check
-        foot = ttk.Frame(self.root)
+        foot = ttk.Frame(container)
         foot.pack(fill="x", **pad)
         self.update_btn = ttk.Button(foot, text="Check for updates", command=self.check_updates)
         self.update_btn.pack(side="left")
