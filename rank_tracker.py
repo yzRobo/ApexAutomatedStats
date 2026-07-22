@@ -341,19 +341,42 @@ class RankTracker:
             learned_uid = _extract_uid(data)
             season = _extract_season(data)
             state, in_game = _extract_realtime(data)
+            # EA/ALS occasionally serves a degraded response with rankScore=0 (or
+            # a missing rank block → None) for a player who very much has RP.
+            # Trusting it poisons everything downstream: a 0 baseline, bogus
+            # ledger readings, false resets, fabricated deltas. A placed player's
+            # real rankScore is never 0, so treat <=0 as a failed reading and KEEP
+            # the last good cache value instead of overwriting it.
+            if rp is not None and rp <= 0:
+                _log(f"[RankTracker] {name}: ignoring rankScore={rp} "
+                     f"(EA/ALS glitch; keeping last good reading)")
+                rp = None
             newly_learned = None
             with self._lock:
-                prev = self._cache.get(name, {}).get("current_rp")
-                self._cache[name] = {
-                    "current_rp": rp,
-                    "previous_rp": prev,
-                    "rank_name": rank_name,
-                    "rank_div": rank_div,
-                    "season": season,
-                    "state": state,
-                    "in_game": in_game,
-                    "last_updated": time.time(),
-                }
+                entry = self._cache.get(name)
+                if rp is not None:
+                    prev = entry.get("current_rp") if entry else None
+                    self._cache[name] = {
+                        "current_rp": rp,
+                        "previous_rp": prev,
+                        "rank_name": rank_name,
+                        "rank_div": rank_div,
+                        "season": season,
+                        "state": state,
+                        "in_game": in_game,
+                        "last_updated": time.time(),
+                    }
+                elif entry is None:
+                    # First contact was degraded: record the player as resolved
+                    # but leave RP empty (never store a bogus 0/None over data).
+                    self._cache[name] = {
+                        "current_rp": None, "previous_rp": None,
+                        "rank_name": rank_name, "rank_div": rank_div,
+                        "season": season, "state": state, "in_game": in_game,
+                        "last_updated": time.time(),
+                    }
+                # else: keep the previous good entry untouched — a stale real
+                # value beats a fresh bogus one for baselines and status alike.
                 self._ever_resolved.add(name)
                 self._notfound_counts.pop(name, None)
                 self._warned.discard(name)

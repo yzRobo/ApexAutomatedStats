@@ -78,15 +78,18 @@ def test_slow_propagation_waits_then_resolves():
 # --------------------------------------------------------------------------- #
 def test_net_zero_hint_true():
     # Demotion-floor loss: RP pinned at a division floor, genuine 0, badge=ranked.
+    # The pre-match observation proves the baseline predates the match's end.
     pending = [rec("A", "yzRobo", 800, 1000, hint=True)]
-    res = resolve_rp(pending, {"yzRobo": flat_series(1000, 800, 7)}, now=1500, **DEFAULTS)
+    observations = {"yzRobo": [obs(900, 800)] + flat_series(1000, 800, 7)}
+    res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
     assert patch_for(res, "A", "yzRobo") == {"ending_rp": 800, "rp_change": 0, "ranked": True}
     assert ("A", "yzRobo") in res.resolved
 
 
 def test_net_zero_hint_false_is_pub():
     pending = [rec("A", "yzRobo", 800, 1000, hint=False)]
-    res = resolve_rp(pending, {"yzRobo": flat_series(1000, 800, 7)}, now=1500, **DEFAULTS)
+    observations = {"yzRobo": [obs(900, 800)] + flat_series(1000, 800, 7)}
+    res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
     # Pub: mark ranked=false, leave RP null (never a fabricated 0).
     assert patch_for(res, "A", "yzRobo") == {"ranked": False}
     assert ("A", "yzRobo") in res.resolved
@@ -94,10 +97,22 @@ def test_net_zero_hint_false_is_pub():
 
 def test_net_zero_hint_none_is_unknown():
     pending = [rec("A", "yzRobo", 800, 1000, hint=None)]
-    res = resolve_rp(pending, {"yzRobo": flat_series(1000, 800, 7)}, now=1500, **DEFAULTS)
+    observations = {"yzRobo": [obs(900, 800)] + flat_series(1000, 800, 7)}
+    res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
     assert patch_for(res, "A", "yzRobo") is None      # nothing written
     assert ("A", "yzRobo") in res.resolved            # but resolved (honest blank)
     assert any("unknown" in n for n in res.notes)
+
+
+def test_zero_without_pre_match_observation_is_unknown():
+    # Tracker started on/after the summary screen: the frozen baseline may already
+    # contain the match's result, so a flat reading proves nothing. Honest blank,
+    # NOT a fabricated 0 — this was the "first game of the night is 0" bug.
+    pending = [rec("A", "yzRobo", 800, 1000, hint=True)]
+    res = resolve_rp(pending, {"yzRobo": flat_series(1000, 800, 7)}, now=1500, **DEFAULTS)
+    assert patch_for(res, "A", "yzRobo") is None
+    assert ("A", "yzRobo") in res.resolved
+    assert any("never observed before" in n for n in res.notes)
 
 
 def test_zero_not_confirmed_waits_on_too_few_polls():
@@ -247,6 +262,82 @@ def test_no_baseline_is_skipped():
     pending = [rec("A", "SomeRandom", None, 1000, hint=True)]
     res = resolve_rp(pending, {"SomeRandom": [obs(1200, 1234)]}, now=1300, **DEFAULTS)
     assert res.patches == [] and res.resolved == [] and res.notes == []
+
+
+# --------------------------------------------------------------------------- #
+# persistent chain — baseline correction across sweeps/restarts
+# --------------------------------------------------------------------------- #
+def test_chain_corrects_stale_baseline_no_double_attribution():
+    # Match A (already resolved, -65 at obs ts=1250) then match B logged at 1300
+    # with a STALE frozen baseline (12335: EA hadn't propagated A's loss when B's
+    # cache snapshot froze). Without the chain, B resolves off the same movement
+    # as A (-65 duplicated, or -130 floor-blanked). With the chain anchor, B's
+    # baseline is corrected to A's observed end and B gets ITS OWN delta.
+    pending = [rec("B", "yzRobo", 12335, 1300, hint=True)]
+    observations = {"yzRobo": [obs(1100, 12335), obs(1250, 12270), obs(1400, 12205)]}
+    chain = {"yzRobo": {"end": 12270, "ts": 1250}}
+    res = resolve_rp(pending, observations, now=1500, chain=chain, **DEFAULTS)
+    assert patch_for(res, "B", "yzRobo") == {"ending_rp": 12205, "rp_change": -65, "ranked": True}
+    assert any("baseline corrected" in n for n in res.notes)
+
+
+def test_chain_early_leaver_gain_attributed_not_zero():
+    # A player who dies and leaves has their RP post BEFORE the squad's summary
+    # screen is read, so the frozen baseline already contains their +27 and the
+    # readings sit flat afterwards — v1.6.1 stamped a false 0. The chain anchors
+    # at the previous resolution's end, exposing the +27 as this match's delta.
+    pending = [rec("M", "NameJFK", 10053, 1300, hint=True)]
+    observations = {"NameJFK": [obs(940, 10026), obs(1000, 10053), obs(1100, 10053)]
+                    + flat_series(1300, 10053, 7)}
+    chain = {"NameJFK": {"end": 10026, "ts": 950}}
+    res = resolve_rp(pending, observations, now=1900, chain=chain, **DEFAULTS)
+    assert patch_for(res, "M", "NameJFK") == {"ending_rp": 10053, "rp_change": 27, "ranked": True}
+
+
+def test_chain_expired_falls_back_to_frozen():
+    # An anchor older than CHAIN_MAX_AGE (overnight gap, untracked play likely)
+    # must not be trusted — the frozen baseline is used instead.
+    pending = [rec("A", "yzRobo", 500, 10000, hint=True)]
+    observations = {"yzRobo": [obs(9900, 500)] + flat_series(10000, 500, 7)}
+    chain = {"yzRobo": {"end": 400, "ts": 100}}   # ancient
+    res = resolve_rp(pending, observations, now=10500, chain=chain, **DEFAULTS)
+    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 500, "rp_change": 0, "ranked": True}
+    assert not any("baseline corrected" in n for n in res.notes)
+
+
+def test_chain_invalidated_by_untracked_play_in_gap():
+    # Movement observed in the gap well before the match (an untracked solo game)
+    # means the chain can't vouch for this match's baseline — frozen wins, so the
+    # untracked game's delta is NOT misattributed to this match.
+    pending = [rec("A", "yzRobo", 1040, 3000, hint=True)]
+    observations = {"yzRobo": [obs(150, 1000), obs(1200, 1040), obs(2900, 1040)]
+                    + flat_series(3000, 1040, 7)}
+    chain = {"yzRobo": {"end": 1000, "ts": 160}}
+    res = resolve_rp(pending, observations, now=3600, chain=chain, **DEFAULTS)
+    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 1040, "rp_change": 0, "ranked": True}
+    assert not any("baseline corrected" in n for n in res.notes)
+
+
+def test_chain_invalidated_by_reset_in_gap():
+    pending = [rec("A", "yzRobo", 120, 3000, hint=True)]
+    observations = {"yzRobo": [obs(2500, 120, reset=True), obs(2900, 120)]
+                    + flat_series(3000, 120, 7)}
+    chain = {"yzRobo": {"end": 1000, "ts": 2400}}
+    res = resolve_rp(pending, observations, now=3600, chain=chain, **DEFAULTS)
+    # Frozen baseline (120) used; zero-confirms against it, never a -880 "delta".
+    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 120, "rp_change": 0, "ranked": True}
+
+
+def test_chain_updates_emitted_on_resolutions():
+    pending = [rec("A", "yzRobo", 1000, 1000, hint=None)]
+    observations = {"yzRobo": [obs(1000, 1000), obs(1200, 1030)]}
+    res = resolve_rp(pending, observations, now=1300, **DEFAULTS)
+    assert res.chain_updates["yzRobo"] == {"end": 1030, "ts": 1200}
+    # Zero path anchors at the confirmed-flat value.
+    pending = [rec("Z", "SaWaii", 800, 1000, hint=True)]
+    observations = {"SaWaii": [obs(900, 800)] + flat_series(1000, 800, 7)}
+    res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
+    assert res.chain_updates["SaWaii"]["end"] == 800
 
 
 # --------------------------------------------------------------------------- #

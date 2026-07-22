@@ -41,6 +41,14 @@ class RpResolution:
     notes        -- console lines describing honest blanks / ambiguity.
     latencies    -- [(session_id, name, seconds)] propagation latency per resolved
                     match (first_changed_ts - logged_epoch), for cadence tuning.
+    chain_updates-- {name: {"end": rp, "ts": obs_ts}} per-player anchors after each
+                    resolution: the last OBSERVED value/timestamp the resolution
+                    ended on. The caller persists these (rp_chain.json) and passes
+                    them back as ``chain`` so the next match's baseline can be
+                    corrected even across sweeps, restarts, or a cleared queue —
+                    a frozen cache snapshot alone is contaminable (EA propagation
+                    lag, a squadmate's RP posting early when they leave a match
+                    before the summary screen is read).
     """
 
     patches: list = field(default_factory=list)
@@ -48,6 +56,7 @@ class RpResolution:
     rebaselines: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
     latencies: list = field(default_factory=list)
+    chain_updates: dict = field(default_factory=dict)
 
 
 def hint_of(rec):
@@ -82,8 +91,24 @@ def _patch(rec, name, *, ending_rp=None, rp_change=None, ranked=None):
     }
 
 
+# Zero-confirm requires evidence the baseline existed BEFORE the match ended:
+# an observation at least this many seconds pre-log equal to the baseline. Without
+# it (tracker started on/after the summary screen), the frozen baseline may
+# already contain the match's own result, and "no movement" proves nothing.
+PRE_OBS_MARGIN = 60
+# A chain anchor older than this is stale (overnight / untracked play in between).
+CHAIN_MAX_AGE = 7200
+# Observed RP movement between the chain anchor and this many seconds before the
+# match's log time means someone played an UNTRACKED game in the gap — the chain
+# can't vouch for the baseline. Movement inside the final window is different:
+# that's plausibly this match's own result posting early (a player who dies and
+# leaves finalizes RP before the squad's summary screen is read) and is exactly
+# what the chain exists to see through. ~ one long match.
+CHAIN_QUIET_WINDOW = 1500
+
+
 def resolve_rp(pending, observations, now, *, loss_floor=-100,
-               zero_confirm_polls=6, zero_confirm_seconds=360):
+               zero_confirm_polls=6, zero_confirm_seconds=360, chain=None):
     """Classify each player's earliest pending match against the ledger.
 
     Parameters
@@ -108,6 +133,13 @@ def resolve_rp(pending, observations, now, *, loss_floor=-100,
         A flat reading is only a *genuine* 0 once at least this many successful
         observations, spanning at least this many seconds after the match, all
         equal the baseline (replaces the old infinite ``current == start`` wait).
+    chain : dict | None
+        ``{name: {"end": rp, "ts": obs_ts}}`` — each player's previous resolution
+        anchor (persisted by the caller). When fresh and uncontradicted it
+        OVERRIDES the record's frozen ``starting_rp``: the frozen cache snapshot
+        can be stale (previous match not yet propagated → the same movement gets
+        attributed to two matches) or contaminated (this match's own result posted
+        early via a player who left before the summary was read → false 0).
 
     Returns
     -------
@@ -128,17 +160,55 @@ def resolve_rp(pending, observations, now, *, loss_floor=-100,
     for name, recs in by_name.items():
         recs = sorted(recs, key=lambda r: r.get("logged_epoch", 0.0))
         obs = sorted(observations.get(name, []), key=lambda o: o["ts"])
-        _resolve_one_player(name, recs, obs, res, loss_floor,
+        anchor = (chain or {}).get(name)
+        _resolve_one_player(name, recs, obs, anchor, res, loss_floor,
                             zero_confirm_polls, zero_confirm_seconds)
     return res
 
 
-def _resolve_one_player(name, recs, obs, res, loss_floor, zc_polls, zc_seconds):
+def _effective_baseline(name, rec0, obs, anchor, res):
+    """The baseline to resolve against: the persisted chain anchor when it is
+    fresh and uncontradicted, else the record's frozen ``starting_rp``.
+
+    The chain wins only when ALL hold — otherwise the frozen snapshot, for all
+    its faults, is the honest fallback:
+      * anchored at/before this match was logged, and not stale (CHAIN_MAX_AGE);
+      * no reset discontinuity between the anchor and the log;
+      * no observed movement in the gap OLDER than CHAIN_QUIET_WINDOW before the
+        log (that would mean an untracked game whose delta the chain would
+        otherwise misattribute to this match; movement INSIDE the final window is
+        plausibly this match's own early-posted result and is chained through).
+    """
+    start = rec0["starting_rp"]
+    t0 = rec0.get("logged_epoch", 0.0)
+    if not anchor:
+        return start
+    ts, end = anchor.get("ts"), anchor.get("end")
+    if ts is None or end is None or ts > t0 or (t0 - ts) > CHAIN_MAX_AGE:
+        return start
+    between = [o for o in obs if ts < o["ts"] <= t0]
+    if any(o.get("reset") for o in between):
+        return start
+    if any(o["rp"] != end and o["ts"] <= t0 - CHAIN_QUIET_WINDOW for o in between):
+        return start  # untracked play in the gap — chain can't vouch
+    if end != start:
+        res.notes.append(
+            f"{rec0['session_id']} / {name}: baseline corrected "
+            f"{start} -> {end} (chained from the previous resolution; the frozen "
+            f"snapshot was stale or already contained this match's result).")
+    return end
+
+
+def _resolve_one_player(name, recs, obs, anchor, res, loss_floor, zc_polls, zc_seconds):
     """Resolve the earliest pending match for one player against its ledger."""
     rec0 = recs[0]
     rec1 = recs[1] if len(recs) > 1 else None
-    start = rec0["starting_rp"]
+    start = _effective_baseline(name, rec0, obs, anchor, res)
     t0 = rec0.get("logged_epoch", 0.0)
+    # Evidence the baseline predates the match's end: an observation comfortably
+    # before log time that equals it. Without this, "readings never moved" cannot
+    # distinguish a genuine 0 from a baseline that already contained the result.
+    pre_ok = any(o["ts"] <= t0 - PRE_OBS_MARGIN and o["rp"] == start for o in obs)
 
     # Only readings taken at/after the match was logged can reflect its outcome.
     post = [o for o in obs if o["ts"] >= t0]
@@ -164,6 +234,8 @@ def _resolve_one_player(name, recs, obs, res, loss_floor, zc_polls, zc_seconds):
             f"{rec0['session_id']} / {name}: baseline spans an RP reset "
             f"(season rollover) - left blank (no delta across a reset).")
         res.resolved.append(key0)
+        # Anchor the chain at the last post-reset observation.
+        res.chain_updates[name] = {"end": post[-1]["rp"], "ts": post[-1]["ts"]}
         if rec1 is not None:
             # Re-anchor the next match to the value it actually STARTED from — the
             # last reading before rec1 was logged (post-reset) — not the latest
@@ -181,13 +253,17 @@ def _resolve_one_player(name, recs, obs, res, loss_floor, zc_polls, zc_seconds):
 
     # No change and no reset: every post-baseline reading equals `start` → a
     # zero-delta candidate (rule 2).
-    _resolve_zero(name, rec0, rec1, recs, start, t0, post, res, zc_polls, zc_seconds)
+    _resolve_zero(name, rec0, rec1, recs, start, t0, post, pre_ok, res,
+                  zc_polls, zc_seconds)
 
 
 def _resolve_changed(name, rec0, rec1, recs, start, changed, post, res, loss_floor):
     """Rule 1 (clean single match) / rule 3 (collapsed pair) for an observed move."""
     key0 = (rec0["session_id"], name)
     delta = changed["rp"] - start
+    # Whatever the outcome, the world was OBSERVED at `changed` — anchor the chain
+    # there so the next match's baseline can be corrected against it.
+    res.chain_updates[name] = {"end": changed["rp"], "ts": changed["ts"]}
 
     if rec1 is not None and changed["ts"] >= rec1.get("logged_epoch", 0.0):
         # The move wasn't observed before the next match was logged, so this one
@@ -266,15 +342,33 @@ def _resolve_collapsed(name, rec0, rec1, recs, start, changed, delta, res, loss_
                 break
 
 
-def _resolve_zero(name, rec0, rec1, recs, start, t0, post, res, zc_polls, zc_seconds):
+def _resolve_zero(name, rec0, rec1, recs, start, t0, post, pre_ok, res,
+                  zc_polls, zc_seconds):
     """Rule 2 (zero-confirm): a flat reading is a *genuine* 0 only once enough
-    stable observations span a full propagation window. Caller guarantees every
-    reading in ``post`` equals ``start`` (no change, no reset).
+    stable observations span a full propagation window AND the baseline is known
+    to predate the match (``pre_ok``). Caller guarantees every reading in ``post``
+    equals ``start`` (no change, no reset).
     """
     enough_polls = len(post) >= zc_polls
     enough_span = (post[-1]["ts"] - t0) >= zc_seconds
     if not (enough_polls and enough_span):
         return  # keep waiting; RP may still be propagating (EA cache lag)
+
+    # The chain anchors at the confirmed-flat value either way.
+    res.chain_updates[name] = {"end": start, "ts": post[-1]["ts"]}
+
+    if not pre_ok:
+        # No observation shows this baseline existed BEFORE the match ended (e.g.
+        # the tracker was started on the summary screen), so the frozen value may
+        # already include the match's own result — "no movement" proves nothing.
+        # Resolve as honest unknown rather than stamping a fabricated 0.
+        res.notes.append(
+            f"{rec0['session_id']} / {name}: readings flat, but the baseline was "
+            f"never observed before the match ended (tracker started too late?) - "
+            f"can't distinguish a genuine 0 from an already-included result; "
+            f"left blank.")
+        res.resolved.append((rec0["session_id"], name))
+        return
 
     if rec1 is not None:
         # Need to have observed rec0's OWN window flat (a reading before rec1 was

@@ -53,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -1524,6 +1524,38 @@ def _rp_pending_path():
     return os.path.join(HERE, "rp_pending.json")
 
 
+def _rp_chain_path():
+    return os.path.join(HERE, "rp_chain.json")
+
+
+def _load_rp_chain():
+    """Per-player resolution anchors ``{name: {"end": rp, "ts": obs_ts}}``.
+
+    Persisted so baseline chaining survives sweeps, restarts, and even a cleared
+    pending queue — losing the chain is exactly what let one RP movement get
+    attributed to two consecutive matches. Caller holds _RP_PENDING_LOCK."""
+    path = _rp_chain_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_rp_chain(chain):
+    """Atomic write, same pattern as the pending queue. Caller holds the lock."""
+    path = _rp_chain_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(chain, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _load_rp_pending():
     path = _rp_pending_path()
     if not os.path.exists(path):
@@ -1648,21 +1680,40 @@ def _rp_resolve_sweep():
         except Exception as exc:
             print(f"[{datetime.now():%H:%M:%S}] (ALS) RP poll error - {exc}")
 
-    # Gather each pending player's ledger observations from just before their
-    # earliest pending match (a small margin catches the baseline-era reading and
-    # any reset marker) through now.
+    # Gather each pending player's ledger observations from well before their
+    # earliest pending match: the pre-log history feeds the zero-confirm
+    # pre-match-evidence guard and the chain-anchor validity checks (untracked
+    # play / reset detection in the gap).
+    with _RP_PENDING_LOCK:
+        chain = _load_rp_chain()
     observations = {}
     for name in names:
         earliest = min(r.get("logged_epoch", now) for r in fresh if r["name"] == name)
-        observations[name] = _RANK_TRACKER.get_observations(name, earliest - 60)
+        since = earliest - 1800
+        anchor_ts = (chain.get(name) or {}).get("ts")
+        if anchor_ts:
+            since = min(since, anchor_ts - 60)
+        observations[name] = _RANK_TRACKER.get_observations(name, since)
 
     actions = resolve_rp(fresh, observations, now, loss_floor=loss_floor,
-                         zero_confirm_polls=zero_polls, zero_confirm_seconds=zero_secs)
+                         zero_confirm_polls=zero_polls, zero_confirm_seconds=zero_secs,
+                         chain=chain)
 
     for patch in actions.patches:
-        _safe_patch_rp(patch.get("csv_path"), patch["session_id"],
-                       {patch["name"]: patch["set"]})
         cols = patch["set"]
+        # Last-ditch invariants: nothing beyond a believable single-game loss and
+        # no non-positive RP totals ever reach the CSV/DB, no matter what upstream
+        # produced them (a bogus ALS reading, a poisoned baseline, an old build's
+        # queue). Blocked patches resolve as honest blanks, loudly.
+        chg = cols.get("rp_change")
+        end = cols.get("ending_rp")
+        if (chg is not None and chg < loss_floor) or (end is not None and end <= 0):
+            print(f"[{datetime.now():%H:%M:%S}] (ALS) BLOCKED implausible RP patch "
+                  f"for {patch['session_id']} / {patch['name']}: {cols} "
+                  f"(left blank).")
+            continue
+        _safe_patch_rp(patch.get("csv_path"), patch["session_id"],
+                       {patch["name"]: cols})
         print(f"[{datetime.now():%H:%M:%S}] (ALS) RP resolved for "
               f"{patch['session_id']} / {patch['name']}: {cols}.")
     for note in actions.notes:
@@ -1678,7 +1729,8 @@ def _rp_resolve_sweep():
     rebaseline = {k: v for k, v in actions.rebaselines.items()}
 
     # Reconcile under the lock (a concurrent enqueue may have appended): drop
-    # resolved + expired, apply chained baselines, keep everything else.
+    # resolved + expired, apply chained baselines, persist the chain anchors,
+    # keep everything else.
     with _RP_PENDING_LOCK:
         records = _load_rp_pending()
         out = []
@@ -1693,6 +1745,13 @@ def _rp_resolve_sweep():
                 r["starting_rp"] = rebaseline[key]
             out.append(r)
         _save_rp_pending(out)
+        if actions.chain_updates:
+            chain = _load_rp_chain()  # reload: another sweep may have written
+            chain.update(actions.chain_updates)
+            try:
+                _save_rp_chain(chain)
+            except Exception as exc:
+                print(f"[{datetime.now():%H:%M:%S}] (ALS) chain save failed - {exc}")
 
 
 def _safe_patch_rp(csv_path_str, session_id, resolved):
