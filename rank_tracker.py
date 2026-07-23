@@ -435,7 +435,7 @@ class RankTracker:
         tier_unknown = _tier_index(tier) < 0 or _tier_index(prev_tier) < 0
         reset = bool(season_changed or (big_drop and (tier_dropped or tier_unknown)))
 
-        entry = {"ts": time.time(), "rp": rp, "reset": reset}
+        entry = {"ts": time.time(), "rp": rp, "reset": reset, "in_game": in_game}
         line = None
         # Ring + reset-detection state are per-instance (own lock).
         with self._ledger_lock:
@@ -516,7 +516,8 @@ class RankTracker:
                     ring = self._obs.get(name)
                     if ring is None:
                         ring = self._obs[name] = deque(maxlen=_LEDGER_RING)
-                    ring.append({"ts": ts, "rp": rp, "reset": bool(d.get("reset"))})
+                    ring.append({"ts": ts, "rp": rp, "reset": bool(d.get("reset")),
+                                 "in_game": d.get("in_game")})
                     # Seed reset-detection state so it continues across the restart.
                     self._last_rp[name] = rp
                     if d.get("season") is not None:

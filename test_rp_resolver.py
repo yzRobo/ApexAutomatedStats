@@ -20,8 +20,8 @@ def rec(session, name, start, logged, hint=None, csv="apex_matches.csv", slot=1)
             "ranked_hint": hint, "csv_path": csv}
 
 
-def obs(ts, rp, reset=False):
-    return {"ts": ts, "rp": rp, "reset": reset}
+def obs(ts, rp, reset=False, in_game=None):
+    return {"ts": ts, "rp": rp, "reset": reset, "in_game": in_game}
 
 
 def flat_series(t0, rp, count, step=70):
@@ -102,6 +102,36 @@ def test_net_zero_hint_none_is_unknown():
     assert patch_for(res, "A", "yzRobo") is None      # nothing written
     assert ("A", "yzRobo") in res.resolved            # but resolved (honest blank)
     assert any("unknown" in n for n in res.notes)
+
+
+def test_zero_deferred_while_player_still_in_match():
+    # Early-leaver / instant-requeue: readings are flat but the player is still
+    # IN a match, so EA is serving stale pre-match RP — do NOT zero-confirm yet.
+    pending = [rec("A", "TCremer22", 8500, 1000, hint=True)]
+    observations = {"TCremer22": [obs(900, 8500, in_game=True)]
+                    + [obs(1000 + i * 70, 8500, in_game=True) for i in range(7)]}
+    res = resolve_rp(pending, observations, now=1600, **DEFAULTS)
+    assert res.patches == [] and res.resolved == []   # waiting, not a false 0
+
+
+def test_zero_confirms_once_settled_out_of_match():
+    # Same flat readings, but the last one caught the player OUT of the match
+    # (in the lobby) at the same RP → now it's a genuine, settled 0.
+    pending = [rec("A", "TCremer22", 8500, 1000, hint=True)]
+    observations = {"TCremer22": [obs(900, 8500, in_game=True)]
+                    + [obs(1000 + i * 70, 8500, in_game=True) for i in range(6)]
+                    + [obs(1500, 8500, in_game=False)]}
+    res = resolve_rp(pending, observations, now=1600, **DEFAULTS)
+    assert patch_for(res, "A", "TCremer22") == {"ending_rp": 8500, "rp_change": 0, "ranked": True}
+
+
+def test_zero_guard_skipped_when_presence_hidden():
+    # EA privacy hides realtime (in_game all None) → guard can't apply, behaviour
+    # is unchanged (resolves on the pre-match + span evidence like before).
+    pending = [rec("A", "yzRobo", 800, 1000, hint=True)]
+    observations = {"yzRobo": [obs(900, 800)] + flat_series(1000, 800, 7)}  # in_game=None
+    res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
+    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 800, "rp_change": 0, "ranked": True}
 
 
 def test_zero_without_pre_match_observation_is_unknown():

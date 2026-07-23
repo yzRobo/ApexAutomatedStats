@@ -53,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 

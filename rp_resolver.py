@@ -354,6 +354,19 @@ def _resolve_zero(name, rec0, rec1, recs, start, t0, post, pre_ok, res,
     if not (enough_polls and enough_span):
         return  # keep waiting; RP may still be propagating (EA cache lag)
 
+    # In-game guard: EA/ALS serves a player's STALE pre-match rankScore while they
+    # are IN a match, so a flat reading from an in-match player proves nothing —
+    # their real result hasn't posted yet. If we have presence data (isInGame) and
+    # have NOT yet seen this value while they were OUT of a match (settled in the
+    # lobby), keep waiting. This is the exact failure mode of a player who dies
+    # early and instantly re-queues: perpetually in-match, RP frozen for several
+    # games, then a single collapsed jump. When presence is absent (EA privacy
+    # hides realtime → all None), the guard is skipped and behaviour is unchanged.
+    have_presence = any(o.get("in_game") is not None for o in post)
+    settled = any(o.get("in_game") is False for o in post)
+    if have_presence and not settled:
+        return  # RP flat but the player is still in-match — reading is stale, wait
+
     # The chain anchors at the confirmed-flat value either way.
     res.chain_updates[name] = {"end": start, "ts": post[-1]["ts"]}
 
