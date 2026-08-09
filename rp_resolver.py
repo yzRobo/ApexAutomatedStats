@@ -70,13 +70,18 @@ def hint_of(rec):
     return rec.get("ranked")
 
 
-def _patch(rec, name, *, ending_rp=None, rp_change=None, ranked=None):
+def _patch(rec, name, *, starting_rp=None, ending_rp=None, rp_change=None, ranked=None):
     """Build a patch entry that writes ONLY the provided columns.
 
     ``is not None`` guards keep a legitimate ``rp_change=0`` and ``ranked=False``
     (both falsy) while dropping the "don't touch this column" sentinel None.
+    ``starting_rp`` is the EFFECTIVE baseline actually used (may be chain-corrected
+    off the frozen snapshot) — writing it keeps start/end/change consistent in the
+    row so a resolved game never reads as "start==end but change!=0".
     """
     columns = {}
+    if starting_rp is not None:
+        columns["starting_rp"] = starting_rp
     if ending_rp is not None:
         columns["ending_rp"] = ending_rp
     if rp_change is not None:
@@ -280,8 +285,9 @@ def _resolve_changed(name, rec0, rec1, recs, start, changed, post, res, loss_flo
             f"loss (untracked game or ALS glitch) - left blank (no fabricated value).")
         res.resolved.append(key0)
     else:
-        res.patches.append(_patch(rec0, name, ending_rp=changed["rp"],
-                                  rp_change=delta, ranked=True))
+        res.patches.append(_patch(rec0, name, starting_rp=start,
+                                  ending_rp=changed["rp"], rp_change=delta,
+                                  ranked=True))
         res.resolved.append(key0)
         res.latencies.append((rec0["session_id"], name,
                               changed["ts"] - rec0.get("logged_epoch", 0.0)))
@@ -310,14 +316,14 @@ def _resolve_collapsed(name, rec0, rec1, recs, start, changed, delta, res, loss_
     endpoint = changed["rp"] if changed is not None else start
 
     if h0 is True and h1 is False and delta >= loss_floor:
-        res.patches.append(_patch(rec0, name, ending_rp=endpoint,
-                                  rp_change=delta, ranked=True))
+        res.patches.append(_patch(rec0, name, starting_rp=start,
+                                  ending_rp=endpoint, rp_change=delta, ranked=True))
         res.patches.append(_patch(rec1, name, ranked=False))
         res.resolved += [key0, key1]
     elif h0 is False and h1 is True and delta >= loss_floor:
         res.patches.append(_patch(rec0, name, ranked=False))
-        res.patches.append(_patch(rec1, name, ending_rp=endpoint,
-                                  rp_change=delta, ranked=True))
+        res.patches.append(_patch(rec1, name, starting_rp=start,
+                                  ending_rp=endpoint, rp_change=delta, ranked=True))
         res.resolved += [key0, key1]
     else:
         res.notes.append(
@@ -405,7 +411,8 @@ def _apply_zero(rec, name, hint, start, res):
     if hint is True:
         # Real ranked net-zero (demotion-protection pins RP at a division floor):
         # a confirmed 0 is a legitimate resolved value.
-        res.patches.append(_patch(rec, name, ending_rp=start, rp_change=0, ranked=True))
+        res.patches.append(_patch(rec, name, starting_rp=start, ending_rp=start,
+                                  rp_change=0, ranked=True))
         res.resolved.append(key)
     elif hint is False:
         # No movement + badge says pub → it's a pub. Leave RP null (not a 0).

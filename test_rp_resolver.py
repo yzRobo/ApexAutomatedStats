@@ -46,7 +46,7 @@ def test_normal_single_match():
     pending = [rec("A", "yzRobo", 1000, 1000, hint=None)]
     observations = {"yzRobo": [obs(1000, 1000), obs(1100, 1000), obs(1200, 1030)]}
     res = resolve_rp(pending, observations, now=1300, **DEFAULTS)
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 1030, "rp_change": 30, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 1000, "ending_rp": 1030, "rp_change": 30, "ranked": True}
     assert ("A", "yzRobo") in res.resolved
     # latency recorded: first_changed_ts - logged_epoch
     assert res.latencies == [("A", "yzRobo", 200)]
@@ -70,7 +70,7 @@ def test_slow_propagation_waits_then_resolves():
     # The delayed changed reading finally lands → clean resolution.
     later = resolve_rp(pending, {"yzRobo": [obs(1030, 1000), obs(1400, 1025)]},
                        now=1450, **DEFAULTS)
-    assert patch_for(later, "A", "yzRobo") == {"ending_rp": 1025, "rp_change": 25, "ranked": True}
+    assert patch_for(later, "A", "yzRobo") == {"starting_rp": 1000, "ending_rp": 1025, "rp_change": 25, "ranked": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +82,7 @@ def test_net_zero_hint_true():
     pending = [rec("A", "yzRobo", 800, 1000, hint=True)]
     observations = {"yzRobo": [obs(900, 800)] + flat_series(1000, 800, 7)}
     res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 800, "rp_change": 0, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 800, "ending_rp": 800, "rp_change": 0, "ranked": True}
     assert ("A", "yzRobo") in res.resolved
 
 
@@ -122,7 +122,7 @@ def test_zero_confirms_once_settled_out_of_match():
                     + [obs(1000 + i * 70, 8500, in_game=True) for i in range(6)]
                     + [obs(1500, 8500, in_game=False)]}
     res = resolve_rp(pending, observations, now=1600, **DEFAULTS)
-    assert patch_for(res, "A", "TCremer22") == {"ending_rp": 8500, "rp_change": 0, "ranked": True}
+    assert patch_for(res, "A", "TCremer22") == {"starting_rp": 8500, "ending_rp": 8500, "rp_change": 0, "ranked": True}
 
 
 def test_zero_guard_skipped_when_presence_hidden():
@@ -131,7 +131,7 @@ def test_zero_guard_skipped_when_presence_hidden():
     pending = [rec("A", "yzRobo", 800, 1000, hint=True)]
     observations = {"yzRobo": [obs(900, 800)] + flat_series(1000, 800, 7)}  # in_game=None
     res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 800, "rp_change": 0, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 800, "ending_rp": 800, "rp_change": 0, "ranked": True}
 
 
 def test_zero_without_pre_match_observation_is_unknown():
@@ -171,7 +171,7 @@ def test_two_matches_intermediate_obs_chains_baseline():
                                obs(1500, 1030), obs(2100, 1055)]}
     res = resolve_rp(pending, observations, now=2200, **DEFAULTS)
     # Earliest match resolves against its isolated move…
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 1030, "rp_change": 30, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 1000, "ending_rp": 1030, "rp_change": 30, "ranked": True}
     # …and the next match's baseline chains to the window-end value (last reading
     # before B was logged), NOT the post-B reading.
     assert res.rebaselines[("B", "yzRobo")] == 1030
@@ -187,7 +187,7 @@ def test_collapsed_one_ranked_one_pub_attributes_to_ranked():
     # No reading isolates A before B is logged; the move shows up only later.
     observations = {"yzRobo": [obs(1000, 1000), obs(1400, 1040)]}
     res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 1040, "rp_change": 40, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 1000, "ending_rp": 1040, "rp_change": 40, "ranked": True}
     assert patch_for(res, "B", "yzRobo") == {"ranked": False}
     assert set(res.resolved) == {("A", "yzRobo"), ("B", "yzRobo")}
 
@@ -198,7 +198,7 @@ def test_collapsed_pub_then_ranked_attributes_to_second():
     observations = {"yzRobo": [obs(1000, 1000), obs(1400, 1040)]}
     res = resolve_rp(pending, observations, now=1500, **DEFAULTS)
     assert patch_for(res, "A", "yzRobo") == {"ranked": False}
-    assert patch_for(res, "B", "yzRobo") == {"ending_rp": 1040, "rp_change": 40, "ranked": True}
+    assert patch_for(res, "B", "yzRobo") == {"starting_rp": 1000, "ending_rp": 1040, "rp_change": 40, "ranked": True}
 
 
 def test_collapsed_ambiguous_leaves_both_blank():
@@ -282,7 +282,7 @@ def test_rehydrated_queue_resolves_from_data_only():
     pending = [rec("OLD", "SaWaii", 9000, 500, hint=None)]
     observations = {"SaWaii": [obs(400, 9000), obs(700, 9048)]}
     res = resolve_rp(pending, observations, now=99999, **DEFAULTS)
-    assert patch_for(res, "OLD", "SaWaii") == {"ending_rp": 9048, "rp_change": 48, "ranked": True}
+    assert patch_for(res, "OLD", "SaWaii") == {"starting_rp": 9000, "ending_rp": 9048, "rp_change": 48, "ranked": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -307,7 +307,7 @@ def test_chain_corrects_stale_baseline_no_double_attribution():
     observations = {"yzRobo": [obs(1100, 12335), obs(1250, 12270), obs(1400, 12205)]}
     chain = {"yzRobo": {"end": 12270, "ts": 1250}}
     res = resolve_rp(pending, observations, now=1500, chain=chain, **DEFAULTS)
-    assert patch_for(res, "B", "yzRobo") == {"ending_rp": 12205, "rp_change": -65, "ranked": True}
+    assert patch_for(res, "B", "yzRobo") == {"starting_rp": 12270, "ending_rp": 12205, "rp_change": -65, "ranked": True}
     assert any("baseline corrected" in n for n in res.notes)
 
 
@@ -321,7 +321,7 @@ def test_chain_early_leaver_gain_attributed_not_zero():
                     + flat_series(1300, 10053, 7)}
     chain = {"NameJFK": {"end": 10026, "ts": 950}}
     res = resolve_rp(pending, observations, now=1900, chain=chain, **DEFAULTS)
-    assert patch_for(res, "M", "NameJFK") == {"ending_rp": 10053, "rp_change": 27, "ranked": True}
+    assert patch_for(res, "M", "NameJFK") == {"starting_rp": 10026, "ending_rp": 10053, "rp_change": 27, "ranked": True}
 
 
 def test_chain_expired_falls_back_to_frozen():
@@ -331,7 +331,7 @@ def test_chain_expired_falls_back_to_frozen():
     observations = {"yzRobo": [obs(9900, 500)] + flat_series(10000, 500, 7)}
     chain = {"yzRobo": {"end": 400, "ts": 100}}   # ancient
     res = resolve_rp(pending, observations, now=10500, chain=chain, **DEFAULTS)
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 500, "rp_change": 0, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 500, "ending_rp": 500, "rp_change": 0, "ranked": True}
     assert not any("baseline corrected" in n for n in res.notes)
 
 
@@ -344,7 +344,7 @@ def test_chain_invalidated_by_untracked_play_in_gap():
                     + flat_series(3000, 1040, 7)}
     chain = {"yzRobo": {"end": 1000, "ts": 160}}
     res = resolve_rp(pending, observations, now=3600, chain=chain, **DEFAULTS)
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 1040, "rp_change": 0, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 1040, "ending_rp": 1040, "rp_change": 0, "ranked": True}
     assert not any("baseline corrected" in n for n in res.notes)
 
 
@@ -355,7 +355,7 @@ def test_chain_invalidated_by_reset_in_gap():
     chain = {"yzRobo": {"end": 1000, "ts": 2400}}
     res = resolve_rp(pending, observations, now=3600, chain=chain, **DEFAULTS)
     # Frozen baseline (120) used; zero-confirms against it, never a -880 "delta".
-    assert patch_for(res, "A", "yzRobo") == {"ending_rp": 120, "rp_change": 0, "ranked": True}
+    assert patch_for(res, "A", "yzRobo") == {"starting_rp": 120, "ending_rp": 120, "rp_change": 0, "ranked": True}
 
 
 def test_chain_updates_emitted_on_resolutions():

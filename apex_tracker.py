@@ -53,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.3"
+__version__ = "1.6.4"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -299,6 +299,14 @@ def init_rank_tracker(cfg):
     names = list(cfg.get("known_names", []))
     uids = dict(cfg.get("als_uids", {}) or {})
     poll = cfg.get("rank_poll_seconds", 30)
+    # Migrate the pre-v1.6 default: 120s is too coarse for RP (results post in
+    # bursts, so back-to-back games collapse into one reading). 30s is the v2
+    # default. Only the exact old default is bumped, so an intentional custom
+    # value is respected. Configs preserved across updates never got this.
+    if poll == 120:
+        poll = 30
+        print("(ALS) migrated rank_poll_seconds 120 -> 30 (finer RP; "
+              "open Settings and Save to make it permanent).")
     sig = (key, tuple(names), tuple(sorted(uids.items())), poll)
     if _RANK_TRACKER is not None and sig == _RANK_TRACKER_SIG:
         return  # nothing relevant changed
@@ -1721,7 +1729,7 @@ def _rp_resolve_sweep():
     # Propagation latency (first_changed_ts - logged_epoch) — the tuning
     # instrument for cadence/windows (§4.2). Debug-level; only if enabled.
     if actions.latencies and cfg.get("capture", {}).get("debug_log"):
-        dbg = _make_debug_logger(cfg)
+        dbg = _make_debug_logger(cfg, header=False)
         for sid, name, secs in actions.latencies:
             dbg(f"RP propagation latency {sid}/{name}: {secs:.0f}s")
 
@@ -2016,14 +2024,21 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
             status["state"] = "watching" if age < stale_after else "stale"
             # Cheaply re-acquire only when needed. During normal play this is just
             # an IsWindow() check (no expensive window scan), so it won't hitch.
-            if time.time() - last_recheck > 30:
+            # OBS mode checks more often + at a lower staleness threshold: a frozen
+            # virtual-camera feed is the ONLY failure signal there (no window to
+            # probe), and a slow recovery is exactly how a summary gets missed —
+            # the feed stalled ~65s once and a game didn't log. Faster recovery
+            # (re-acquire within ~8-12s) catches the summary while it's still up.
+            recheck_every = 8 if cap_mode == "obs" else 30
+            stale_reacquire = 12 if cap_mode == "obs" else 20
+            if time.time() - last_recheck > recheck_every:
                 last_recheck = time.time()
                 if cap_mode == "obs":
                     # OBS reads a virtual camera, NOT the Apex window — so a missing
                     # game window is normal (e.g. tracking on a separate stream PC
                     # where the game isn't running). Re-acquire only when the feed
                     # actually goes stale, never just because there's no hwnd.
-                    need_reacquire = cap.last_frame_age() > 20
+                    need_reacquire = cap.last_frame_age() > stale_reacquire
                 else:
                     alive = hwnd is not None and _user32.IsWindow(hwnd)
                     need_reacquire = (not alive) or cap.last_frame_age() > 20
@@ -2135,11 +2150,15 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     return status["logged_this_run"]
 
 
-def _make_debug_logger(cfg):
+def _make_debug_logger(cfg, header=True):
     """Return a dbg(msg) that appends timestamped lines to debug/tracker_debug.log
     when capture.debug_log is true, else a no-op. Lets you alt-tab out after a
     session and see exactly when the tracker opened capture, what it saw, and when
-    it idled - so you can line probes up against any in-game stutter you felt."""
+    it idled - so you can line probes up against any in-game stutter you felt.
+
+    ``header=False`` skips the '--- session start ---' banner — the RP resolver
+    sweep makes an ephemeral logger every pass, and writing the banner each time
+    spammed the log with bogus 'session start' lines that looked like restarts."""
     if not cfg.get("capture", {}).get("debug_log", False):
         return lambda msg: None
     os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -2152,7 +2171,8 @@ def _make_debug_logger(cfg):
         except Exception:
             pass
 
-    dbg(f"--- session start {datetime.now():%Y-%m-%d %H:%M:%S} ---")
+    if header:
+        dbg(f"--- session start {datetime.now():%Y-%m-%d %H:%M:%S} ---")
     return dbg
 
 
