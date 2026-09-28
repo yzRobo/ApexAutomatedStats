@@ -390,6 +390,79 @@ def test_patch_keeps_falsy_but_valid_values():
 # --------------------------------------------------------------------------- #
 # standalone runner
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# real-ledger replays (stream PC, 2026-09-27): ALS posts RP BEFORE the summary
+# screen is logged, a missed game, and an untracked quick-death game.
+# --------------------------------------------------------------------------- #
+def _ledger(start_rp, steps, t_from, t_to, poll=30):
+    """30s polls over [t_from, t_to] plus a reading exactly at each step time."""
+    pts = sorted(set(range(t_from, t_to + 1, poll)) | {t for t, _ in steps})
+    out = []
+    for t in pts:
+        rp = start_rp
+        for st, v in steps:
+            if st <= t:
+                rp = v
+        out.append(obs(t, rp))
+    return out
+
+
+def _replay(name, observations, logs, t_end):
+    """Drive resolve_rp like the tracker's sweep: frozen starting_rp = latest
+    reading at log time, a sweep every 30s over readings seen so far, rebaselines
+    and chain anchors carried forward. Returns {session: patch}."""
+    pending, chain, out = [], {}, {}
+    logs = sorted(logs, key=lambda l: l[1])
+    for now in range(logs[0][1], t_end + 1, 30):
+        for sid, t in logs:
+            if now - 30 < t <= now:
+                seen = [o for o in observations if o["ts"] <= t]
+                pending.append(rec(sid, name, seen[-1]["rp"], t, hint=True))
+        seen = [o for o in observations if o["ts"] <= now]
+        res = resolve_rp(pending, {name: seen}, now, chain=chain, **DEFAULTS)
+        for p in res.patches:
+            out[p["session_id"]] = p["set"]
+        done = {sid for sid, _ in res.resolved}
+        pending = [r for r in pending if r["session_id"] not in done]
+        for (sid, _), base in res.rebaselines.items():
+            for r in pending:
+                if r["session_id"] == sid:
+                    r["starting_rp"] = base
+        chain.update(res.chain_updates)
+    return out
+
+
+def test_replay_rp_posted_before_log_and_missed_game():
+    # yzRobo 2026-09-27 evening, t=0 is 20:00:00 ET. Every result posted 3-14s
+    # BEFORE its match was logged; the 9:01 win was never logged at all. The old
+    # resolver shifted every game by one (#3 got -43, #12 -14, #7 the win's +275).
+    steps = [(928, 9963), (1449, 9920), (2413, 9906), (3674, 10181)]
+    o = _ledger(9873, steps, -250, 4200)
+    out = _replay("yzRobo", o, [("g3", 940), ("g12", 1452), ("g7", 2427)], 4200)
+    assert out["g3"] == {"starting_rp": 9873, "ending_rp": 9963, "rp_change": 90, "ranked": True}
+    assert out["g12"]["rp_change"] == -43
+    assert out["g7"] == {"starting_rp": 9920, "ending_rp": 9906, "rp_change": -14, "ranked": True}
+
+
+def test_replay_missed_game_logged_manually_later_is_not_absorbed():
+    # Same evening with the win logged too: it gets its own +275.
+    steps = [(928, 9963), (1449, 9920), (2413, 9906), (3674, 10181)]
+    o = _ledger(9873, steps, -250, 4200)
+    out = _replay("yzRobo", o, [("g3", 940), ("g12", 1452), ("g7", 2427), ("win", 3700)], 4200)
+    assert [out[k]["rp_change"] for k in ("g3", "g12", "g7", "win")] == [90, -43, -14, 275]
+
+
+def test_replay_untracked_quick_game_not_folded_into_next():
+    # yzRobo 2026-09-27 afternoon, t=0 is 15:40:54 ET (#13 logged). An untracked
+    # 2-minute game posted -43 at t=617, then #20 was logged at t=744 and posted
+    # -48 at t=747. The chain alone folded both into #20 as -91.
+    steps = [(9, 9878), (617, 9835), (747, 9787)]
+    o = _ledger(9921, steps, -600, 1500)
+    out = _replay("yzRobo", o, [("g13", 0), ("g20", 744)], 1500)
+    assert out["g13"]["rp_change"] == -43
+    assert out["g20"] == {"starting_rp": 9835, "ending_rp": 9787, "rp_change": -48, "ranked": True}
+
+
 if __name__ == "__main__":
     import sys
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

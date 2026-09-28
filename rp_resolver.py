@@ -110,6 +110,16 @@ CHAIN_MAX_AGE = 7200
 # leaves finalizes RP before the squad's summary screen is read) and is exactly
 # what the chain exists to see through. ~ one long match.
 CHAIN_QUIET_WINDOW = 1500
+# ALS often posts a match's RP BEFORE the tracker logs the summary screen (stream-PC
+# ledger 2026-09: 0-35s early). The frozen starting_rp then already contains the
+# result, and a post-log-only search skips it and grabs the NEXT game's move
+# (shifted-by-one RP, cascading through the chain). So a match's own result may
+# land in (log - EARLY_POST_WINDOW, ...]. The shortest observed gap between two
+# logged matches is ~200s, so this can't reach back into the previous game's post.
+EARLY_POST_WINDOW = 90
+# A pre-window ledger reading older than this is too stale to serve as the
+# observed baseline (polls run every ~30s, so a live tracker always has one).
+PRE_BASELINE_MAX_AGE = 900
 
 
 def resolve_rp(pending, observations, now, *, loss_floor=-100,
@@ -171,9 +181,25 @@ def resolve_rp(pending, observations, now, *, loss_floor=-100,
     return res
 
 
+def _observed_baseline(obs, t0):
+    """The last ledger reading taken before this match's result could have posted
+    (at/before ``t0 - EARLY_POST_WINDOW``), or None when there is no fresh one or
+    a reset separates it from the log (then the caller falls back to the chain /
+    frozen snapshot)."""
+    cutoff = t0 - EARLY_POST_WINDOW
+    pre = [o for o in obs if o["ts"] <= cutoff]
+    if not pre or pre[-1]["ts"] < cutoff - PRE_BASELINE_MAX_AGE:
+        return None
+    last = pre[-1]
+    if last.get("reset") or any(o.get("reset") for o in obs if last["ts"] < o["ts"] <= t0):
+        return None
+    return last
+
+
 def _effective_baseline(name, rec0, obs, anchor, res):
-    """The baseline to resolve against: the persisted chain anchor when it is
-    fresh and uncontradicted, else the record's frozen ``starting_rp``.
+    """The baseline to resolve against, as ``(value, from_chain)``: the persisted
+    chain anchor when it is fresh and uncontradicted, else the record's frozen
+    ``starting_rp`` (which the caller may replace with an observed reading).
 
     The chain wins only when ALL hold — otherwise the frozen snapshot, for all
     its faults, is the honest fallback:
@@ -187,36 +213,64 @@ def _effective_baseline(name, rec0, obs, anchor, res):
     start = rec0["starting_rp"]
     t0 = rec0.get("logged_epoch", 0.0)
     if not anchor:
-        return start
+        return start, False
     ts, end = anchor.get("ts"), anchor.get("end")
     if ts is None or end is None or ts > t0 or (t0 - ts) > CHAIN_MAX_AGE:
-        return start
+        return start, False
     between = [o for o in obs if ts < o["ts"] <= t0]
     if any(o.get("reset") for o in between):
-        return start
+        return start, False
     if any(o["rp"] != end and o["ts"] <= t0 - CHAIN_QUIET_WINDOW for o in between):
-        return start  # untracked play in the gap — chain can't vouch
+        return start, False  # untracked play in the gap — chain can't vouch
     if end != start:
         res.notes.append(
             f"{rec0['session_id']} / {name}: baseline corrected "
             f"{start} -> {end} (chained from the previous resolution; the frozen "
             f"snapshot was stale or already contained this match's result).")
-    return end
+    return end, True
 
 
 def _resolve_one_player(name, recs, obs, anchor, res, loss_floor, zc_polls, zc_seconds):
     """Resolve the earliest pending match for one player against its ledger."""
     rec0 = recs[0]
     rec1 = recs[1] if len(recs) > 1 else None
-    start = _effective_baseline(name, rec0, obs, anchor, res)
     t0 = rec0.get("logged_epoch", 0.0)
+    n_notes = len(res.notes)
+    start, chained = _effective_baseline(name, rec0, obs, anchor, res)
+    observed = _observed_baseline(obs, t0)
+    if observed is not None and chained:
+        # A fresh chain normally wins (it sees through an early leaver's result
+        # posting minutes before the summary). But if RP moves right around the
+        # log time, THAT move is this match's result, so any earlier move since
+        # the anchor was an untracked game the chain would fold in (-43 + -48 =
+        # -91 on one row) -> baseline on the reading just before the early window.
+        own_move = any(observed["ts"] < o["ts"] <= t0 + EARLY_POST_WINDOW
+                       and o["rp"] != observed["rp"] for o in obs)
+        if observed["ts"] >= anchor["ts"] and own_move and observed["rp"] != start:
+            del res.notes[n_notes:]  # drop the chain's "baseline corrected" note
+        else:
+            observed = None
+    if observed is not None:
+        # What ALS actually reported just before this match's result could have
+        # posted beats the frozen snapshot, which can already contain it (first
+        # game of a session / no usable chain), or a chain spanning untracked play.
+        start = observed["rp"]
+        if start != rec0["starting_rp"]:
+            res.notes.append(
+                f"{rec0['session_id']} / {name}: baseline corrected "
+                f"{rec0['starting_rp']} -> {start} (observed before the match "
+                f"ended; the frozen snapshot already contained its result).")
+        # Readings after the baseline reading can reflect the outcome, including
+        # an early post shortly before the summary screen was logged.
+        post = [o for o in obs if o["ts"] > observed["ts"]]
+    else:
+        # Baseline isn't an observation, so pre-log readings can't be compared
+        # to it: only readings at/after the log can reflect the outcome.
+        post = [o for o in obs if o["ts"] >= t0]
     # Evidence the baseline predates the match's end: an observation comfortably
     # before log time that equals it. Without this, "readings never moved" cannot
     # distinguish a genuine 0 from a baseline that already contained the result.
     pre_ok = any(o["ts"] <= t0 - PRE_OBS_MARGIN and o["rp"] == start for o in obs)
-
-    # Only readings taken at/after the match was logged can reflect its outcome.
-    post = [o for o in obs if o["ts"] >= t0]
     if not post:
         return  # no reading since the match yet — wait for the next sweep
 
@@ -270,9 +324,10 @@ def _resolve_changed(name, rec0, rec1, recs, start, changed, post, res, loss_flo
     # there so the next match's baseline can be corrected against it.
     res.chain_updates[name] = {"end": changed["rp"], "ts": changed["ts"]}
 
-    if rec1 is not None and changed["ts"] >= rec1.get("logged_epoch", 0.0):
-        # The move wasn't observed before the next match was logged, so this one
-        # reading covers BOTH games and cannot be split (rule 3).
+    if rec1 is not None and changed["ts"] > rec1.get("logged_epoch", 0.0) - EARLY_POST_WINDOW:
+        # The move wasn't observed before the next match's result could have
+        # posted, so this one reading may cover BOTH games and cannot be split
+        # (rule 3).
         _resolve_collapsed(name, rec0, rec1, recs, start, changed, delta, res, loss_floor)
         return
 
@@ -296,7 +351,7 @@ def _resolve_changed(name, rec0, rec1, recs, start, changed, post, res, loss_flo
         # Chain: the next match's baseline is rec0's exclusive-window end value (the
         # last reading before rec1 was logged; `changed` itself qualifies here).
         t1 = rec1.get("logged_epoch", 0.0)
-        window = [o["rp"] for o in post if o["ts"] < t1]
+        window = [o["rp"] for o in post if o["ts"] <= t1 - EARLY_POST_WINDOW]
         res.rebaselines[(rec1["session_id"], rec1["name"])] = (
             window[-1] if window else changed["rp"])
 
