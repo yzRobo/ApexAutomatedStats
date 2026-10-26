@@ -19,10 +19,12 @@ from datetime import datetime
 
 # A windowed (--noconsole) PyInstaller build has no stdout/stderr; library print()
 # calls would then crash. Point them at a sink before anything else runs.
+# utf-8 + errors="replace": the default cp1252/strict sink raised UnicodeEncodeError
+# on a non-ASCII path or name, turning a diagnostic print into a crash.
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
+    sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
 if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+    sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -300,6 +302,11 @@ class App:
         self.detail_lbl = ttk.Label(card, text="", style="Muted.TLabel",
                                     wraplength=470, justify="left")
         self.detail_lbl.pack(anchor="w", padx=10)
+        # Problems that would otherwise be silent: a summary on screen that isn't
+        # logging, one that left unlogged, RP tracking off/failing, a recovered error.
+        self.alert_lbl = ttk.Label(card, text="", foreground=AMBER,
+                                   wraplength=470, justify="left")
+        self.alert_lbl.pack(anchor="w", padx=10)
         self.last_lbl = ttk.Label(card, text="No matches logged yet this run.",
                                   foreground=TEXT, wraplength=470, justify="left")
         self.last_lbl.pack(anchor="w", padx=10, pady=(3, 6))
@@ -533,6 +540,9 @@ class App:
 
     # ------------------------------------------------------------- watcher
     def _set_running(self, running):
+        # A plain flag: ttk's state comes back as a Tcl object, so comparing it to
+        # "disabled" never matched and the UI always thought it was watching.
+        self._running = running
         self.start_btn.config(state="disabled" if running else "normal")
         self.stop_btn.config(state="normal" if running else "disabled")
 
@@ -576,11 +586,48 @@ class App:
 
     # ------------------------------------------------------------- UI poll
     def _refresh(self):
+        # The watcher thread ended on its own (an error at start-up): reflect that
+        # in the buttons so Start works again without a Stop first.
+        if self._thread and not self._thread.is_alive() and getattr(self, "_running", False):
+            self._set_running(False)
         s = self._latest
         state = s.get("state", "idle")
         color, text = STATE_UI.get(state, (GREY, state))
         if s.get("event") == "error":
             color, text = RED, "Error - see details"
+
+        watching = getattr(self, "_running", False)
+        alerts, alert_color, needs_action = [], AMBER, False
+        if watching:
+            if s.get("unread_summary"):
+                alert_color, needs_action = RED, True
+                alerts.append(f"Summary on screen but NOT logging ({s['unread_summary']}). "
+                              f"Press Capture now so it can be added by hand.")
+            missed = s.get("missed")
+            if missed:
+                needs_action = True
+                alerts.append(f"Missed a summary at {missed['time']} ({missed['reason']})"
+                              + (" - frame saved in debug\\unlogged" if missed.get("frame") else ""))
+            rp_state, rp_detail = s.get("rp_state") or (None, None)
+            if rp_state in ("off", "failing"):
+                # 'off' (no key) is normal on a friend's PC, so it's text only; a key
+                # that stopped working is worth the dot.
+                needs_action = needs_action or rp_state == "failing"
+                alerts.append(f"RP tracking {'OFF' if rp_state == 'off' else 'failing'}: "
+                              f"{rp_detail} - matches log without RP.")
+            err = s.get("loop_error")
+            if err and err.get("active"):
+                alert_color, needs_action = RED, True
+                alerts.append(f"Watch error repeating (x{err['count']}): {err['msg']}")
+            elif err:
+                alerts.append(f"Recovered from an error at {err['time']}: {err['msg']}")
+            for key in ("csv_problem", "db_problem"):
+                if s.get(key):
+                    needs_action = True
+                    alerts.append(s[key])
+        self.alert_lbl.config(text="\n".join(alerts), foreground=alert_color)
+        if needs_action and color == GREEN:
+            color = alert_color
         self.dot.itemconfig(self._dot_id, fill=color)
         self.status_lbl.config(text=text)
 
@@ -590,7 +637,7 @@ class App:
         if s.get("resolution"):
             prof = s.get("profile")
             bits.append(f"{s['resolution']} ({'profile ' + prof if prof else 'auto-scaled'})")
-        if s.get("logged_this_run") is not None and self.stop_btn["state"] != "disabled":
+        if s.get("logged_this_run") is not None and watching:
             bits.append(f"{s['logged_this_run']} logged this run")
         if s.get("error"):
             bits.append(s["error"])
@@ -598,7 +645,6 @@ class App:
 
         # Live ranked badge: lit while the current match is flagged ranked (the HUD
         # badge was detected), cleared once that match is logged / a new one starts.
-        watching = self.stop_btn["state"] != "disabled"
         if watching and s.get("match_ranked"):
             self.ranked_lbl.config(text="● RANKED", foreground=GREEN)
         else:
@@ -609,6 +655,8 @@ class App:
             who = ", ".join(f"{p['name']} {p['kills']}k/{p['damage']}" for p in lm["players"])
             tag = {True: "RANKED", False: "PUB"}.get(lm.get("ranked"))
             tagtxt = f"  ·  {tag}" if tag else ""
+            if lm.get("rp_note"):
+                tagtxt += f"  ·  {lm['rp_note']}"
             self.last_lbl.config(
                 text=f"Last [{lm['time']}]{tagtxt}  #{lm['placed']}  "
                      f"{lm['total_kills']} squad kills\n{who}")
@@ -790,7 +838,17 @@ class App:
     def open_csv(self):
         path = core.csv_path(core.load_config())
         if os.path.exists(path):
-            os.startfile(path)  # noqa: SLF / Windows only, which is the target
+            # Open a COPY: Excel locks the file it opens, and the tracker can't
+            # append to a locked CSV while you look at it.
+            import shutil
+            import tempfile
+            view = os.path.join(tempfile.gettempdir(),
+                                f"apex_matches_view_{datetime.now():%H%M%S}.csv")
+            try:
+                shutil.copyfile(path, view)
+            except OSError:
+                view = path
+            os.startfile(view)  # noqa: SLF / Windows only, which is the target
         else:
             messagebox.showinfo("No CSV yet",
                                 "No matches have been logged yet, so there's no CSV.")

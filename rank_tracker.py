@@ -137,6 +137,14 @@ class RankTracker:
         self._notfound_counts = {}
         self._warned = set()
         self._learned_uids = {}
+        # Health for status displays (see health()): when the last usable reading
+        # arrived and the last failure seen. Every failure used to go only to
+        # print(), which the GUI build discards, so a rejected key or an ALS outage
+        # left RP silently off for days while match stats kept logging.
+        self._started_ts = time.time()
+        self._last_ok_ts = None       # last reading with a real rankScore
+        self._last_contact_ts = None  # last HTTP 200 of any kind
+        self._last_error = None
 
         # {name: {"current_rp": int|None, "previous_rp": int|None,
         #          "rank_name": str, "rank_div": int,
@@ -167,6 +175,26 @@ class RankTracker:
         """Return a snapshot ``{name: {current_rp, previous_rp, ...}}``."""
         with self._lock:
             return {k: dict(v) for k, v in self._cache.items()}
+
+    def health(self):
+        """``(state, detail)`` for status displays: ``'starting'`` until the first
+        cycle has had time to finish, ``'ok'`` while usable readings keep arriving,
+        ``'failing'`` (with the last error) once none has for max(3 poll cycles,
+        120 s). A player whose rankScore is always 0 doesn't count against it as
+        long as other players still read."""
+        window = max(3 * self._poll_seconds, 120)
+        now = time.time()
+        with self._lock:
+            last_ok, contact, err = self._last_ok_ts, self._last_contact_ts, self._last_error
+        if last_ok is not None and now - last_ok < window:
+            return "ok", None
+        if contact is not None and now - contact < window:
+            # ALS answers but nobody has ranked RP (off-season / all unranked):
+            # nothing is broken, there's just no RP to track.
+            return "ok", "ALS reachable; no ranked RP to track right now"
+        if last_ok is None and now - self._started_ts < window:
+            return "starting", None
+        return "failing", err or "no readings from ALS"
 
     def unresolved_names(self):
         """Roster names that have NEVER resolved on ALS (misspelled, dropped,
@@ -354,7 +382,10 @@ class RankTracker:
             newly_learned = None
             with self._lock:
                 entry = self._cache.get(name)
+                self._last_contact_ts = time.time()
                 if rp is not None:
+                    self._last_ok_ts = time.time()
+                    self._last_error = None
                     prev = entry.get("current_rp") if entry else None
                     self._cache[name] = {
                         "current_rp": rp,
@@ -398,6 +429,12 @@ class RankTracker:
             _log(f"[RankTracker] {name}: RP={rp}  rank={rank_name} div={rank_div}")
         except urllib.error.HTTPError as exc:
             code = exc.code
+            if code != 404:  # a 404 is one unknown name, not an ALS problem
+                with self._lock:
+                    self._last_error = {
+                        403: "ALS rejected the API key (403)",
+                        429: "ALS rate limit (429)",
+                    }.get(code, f"ALS HTTP {code}")
             if code == 400:
                 _log(f"[RankTracker] {name}: 400 – EA API issue, will retry next cycle")
             elif code == 403:
@@ -410,6 +447,8 @@ class RankTracker:
             else:
                 _log(f"[RankTracker] {name}: HTTP {code}")
         except Exception as exc:
+            with self._lock:
+                self._last_error = f"ALS unreachable ({type(exc).__name__})"
             _log(f"[RankTracker] {name}: error – {exc}")
 
     # ------------------------------------------------------------------ #

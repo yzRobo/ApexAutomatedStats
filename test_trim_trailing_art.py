@@ -16,7 +16,7 @@ from apex_tracker import trim_trailing_art
 
 GAP = 20
 SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      "samples", "capture_20261025_195532.png")
+                      "samples", "capture_20261025_195205.png")
 
 
 # --------------------------------------------------------------------------- #

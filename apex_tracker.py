@@ -53,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.7"
+__version__ = "1.6.8"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -268,6 +268,38 @@ def _sync_ranks_to_supabase(snapshot):
 # side effects.
 _RANK_TRACKER = None
 _RANK_TRACKER_SIG = None  # (key, names, uids, poll) the live tracker was built for
+# Why RP tracking is off when _RANK_TRACKER is None, for the status display. With
+# no key every match logs NULL RP; that used to be completely silent (a squadmate's
+# PC ran for days like that), so it is now surfaced in the GUI and the debug log.
+_RP_OFF_REASON = "no ALS API key set"
+
+# Diagnostics sink for code that runs outside the watch loops (RP sweep, Supabase
+# writes). The GUI build sends stdout to os.devnull, so print() alone vanished; a
+# watch run points this at its debug logger as well.
+_DIAG = None
+
+
+def _note(msg):
+    """print() plus the debug log (when a watch run has enabled it)."""
+    try:
+        print(f"[{datetime.now():%H:%M:%S}] {msg}")
+    except Exception:
+        pass  # a broken stdout must never turn a diagnostic into a failure
+    if _DIAG:
+        try:
+            _DIAG(msg)
+        except Exception:
+            pass
+
+
+def _rp_state():
+    """``(state, detail)`` of RP tracking: 'off' / 'starting' / 'ok' / 'failing'."""
+    if _RANK_TRACKER is None:
+        return "off", _RP_OFF_REASON
+    try:
+        return _RANK_TRACKER.health()
+    except Exception as e:
+        return "failing", str(e)
 # Load .env once so the owner's ALS_API_KEY there is available as a FALLBACK to the
 # config.json key (which the Settings UI edits). Friends ship no ALS key in .env.
 if load_dotenv:
@@ -286,7 +318,7 @@ def init_rank_tracker(cfg):
     start so an API key / roster / UID entered in Settings applies on Stop->Start
     with no app restart. Idempotent: rebuilds only when those settings changed,
     and tears the tracker down if the key was cleared."""
-    global _RANK_TRACKER, _RANK_TRACKER_SIG
+    global _RANK_TRACKER, _RANK_TRACKER_SIG, _RP_OFF_REASON
     key = _resolve_als_key(cfg)
     if not key:
         if _RANK_TRACKER is not None:
@@ -295,6 +327,7 @@ def init_rank_tracker(cfg):
             except Exception:
                 pass
         _RANK_TRACKER, _RANK_TRACKER_SIG = None, None
+        _RP_OFF_REASON = "no ALS API key set (Settings)"
         return
     names = list(cfg.get("known_names", []))
     uids = dict(cfg.get("als_uids", {}) or {})
@@ -329,6 +362,7 @@ def init_rank_tracker(cfg):
               f"(poll every {poll}s).")
     except Exception as e:
         _RANK_TRACKER, _RANK_TRACKER_SIG = None, None
+        _RP_OFF_REASON = f"rank tracker failed to start: {e}"
         print(f"Warning: Failed to start rank tracker: {e}")
 
 # Keep OCR from grabbing every CPU core (which would hitch the game when it runs).
@@ -341,7 +375,22 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 def load_config():
     # utf-8-sig tolerates a BOM, which some editors / PowerShell add when saving.
     with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8-sig") as f:
-        return json.load(f)
+        return _migrate_config(json.load(f))
+
+
+def _migrate_config(cfg):
+    """In-place fixes for shipped values found wrong after release. The updater keeps
+    each install's config.json, so a corrected default only reaches existing installs
+    this way. Each fix applies only while the exact shipped value is still present, so
+    a hand-calibrated region is never touched; a later Settings save persists it."""
+    rows = ((cfg.get("profiles") or {}).get("1920x1080-native-16x9") or {}).get("rows") or {}
+    # The native-16:9 Revive/Respawn boxes sat too low and cut the top off the digits
+    # (respawn lost ~9 of 21 px), so that profile logged revive 1 as 7/None and
+    # respawn 0 as 6. Glyph rows measured on both native-16:9 frames: 624-646 / 694-716.
+    if rows.get("revive") == {"y": 628, "h": 34} and rows.get("respawn") == {"y": 704, "h": 34}:
+        rows["revive"] = {"y": 618, "h": 34}
+        rows["respawn"] = {"y": 688, "h": 34}
+    return cfg
 
 
 def save_config(cfg):
@@ -452,6 +501,14 @@ def digitize(text):
     return "".join(DIGIT_MAP.get(c, c) for c in (text or ""))
 
 
+# The recognizer sometimes returns lone digits in their full-width form ('２'), which
+# pass str.isdigit() but are stripped by parse_int's ASCII filter, so a correct vote
+# became None. Folded only inside the single-digit vote, not in digitize(): there a
+# full-width digit beside CJK junk ('冏７' for a lone gold '1') must stay unreadable
+# rather than turn into a plausible wrong number.
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
 def _rec(img_bgr, upscale=3):
     img = cv2.resize(img_bgr, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
     result, _ = get_ocr()(img, use_det=False, use_cls=False, use_rec=True)
@@ -477,7 +534,8 @@ def ocr_field(img_bgr, numeric=False, single=False, upscale=3):
         for variant in (img_bgr, binbgr):
             for up in (4, 3, 5):
                 tiled = np.hstack([variant] * 5)
-                digits = [c for c in digitize(_rec(tiled, up)) if c.isdigit()]
+                digits = [c for c in digitize(_rec(tiled, up)).translate(_FULLWIDTH_DIGITS)
+                          if c in "0123456789"]
                 if digits:
                     return Counter(digits).most_common(1)[0][0]
         return ""
@@ -510,15 +568,64 @@ def ocr_session(img_bgr):
     return best
 
 
+def _gold_mask(img_bgr):
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array([15, 80, 90]), np.array([42, 255, 255]))
+
+
 def ocr_gold_number(img_bgr, upscale=4):
     """Header numbers (#placed, total kills) are gold on a busy bar next to white
     labels. Isolate the gold pixels so only the number remains, then read it."""
     if img_bgr is None or img_bgr.size == 0:
         return ""
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([15, 80, 90]), np.array([42, 255, 255]))
-    iso = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
+    iso = cv2.bitwise_and(img_bgr, img_bgr, mask=_gold_mask(img_bgr))
     return digitize(_rec(iso, upscale))
+
+
+# The header is right-aligned: "#NN" sits a fixed distance left of the total-kills
+# number, so it moves ~24 base px left when total kills has two digits. With a fixed
+# placement box the leading digit of #10-#20 then falls outside it: #10 / #20 read as
+# 0 (failing the plausibility gate on every retry, so the match was never logged,
+# 2026-08-09) and #11-#19 read as a plausible, wrong 1-9. So the box is anchored to
+# where the total-kills ink starts. _PLACED_INK_REF is that ink's left edge, relative
+# to header.total_kills.x, for the single wide digit the box was calibrated on.
+_PLACED_INK_REF = 89    # base px
+_PLACED_SHIFT = (-40, 20)  # clamp, so a stray speck can't drag the box far
+_PLACED_MIN_SHIFT = 8   # smaller offsets (a single-digit total) keep the configured box
+
+
+def _gold_ink_left(img_bgr, min_run):
+    """x of the first run of >= ``min_run`` columns holding gold ink, or None."""
+    if img_bgr is None or img_bgr.size == 0:
+        return None
+    cols = (_gold_mask(img_bgr) > 0).sum(axis=0) >= max(3, img_bgr.shape[0] // 10)
+    run = 0
+    for x, ink in enumerate(cols):
+        run = run + 1 if ink else 0
+        if run >= min_run:
+            return x - run + 1
+    return None
+
+
+def read_squad_placed(frame, cfg, scale):
+    """Squad placement from a box anchored to the total-kills number (see
+    _PLACED_INK_REF). Falls back to the configured box when the anchor isn't found,
+    the shift is small, or the anchored read isn't a placement."""
+    header = cfg["header"]
+    box = header["squad_placed"]
+    narrow = parse_int(ocr_gold_number(crop(frame, scale(box))))
+    sx = frame.shape[1] / cfg["base_width"]
+    k = cfg["base_width"] / 1920  # the constants are in 1920-wide base px
+    tk = scale(header["total_kills"])
+    left = _gold_ink_left(crop(frame, tk), max(2, int(round(4 * sx))))
+    if left is None:
+        return narrow
+    dx = (tk[0] + left) / sx - (header["total_kills"]["x"] + _PLACED_INK_REF * k)
+    dx = int(round(min(max(dx, _PLACED_SHIFT[0] * k), _PLACED_SHIFT[1] * k)))
+    if abs(dx) < _PLACED_MIN_SHIFT * k:
+        return narrow
+    anchored = parse_int(ocr_gold_number(crop(frame, scale(dict(box, x=box["x"] + dx)))))
+    return anchored if anchored is not None and 1 <= anchored <= 20 else narrow
 
 
 # The character art sits to the right of each card's stat column and reaches into
@@ -687,6 +794,21 @@ def _stats_plausible(match):
     return True
 
 
+def _implausible_detail(match):
+    """Which values failed _stats_plausible, e.g. 'placement 0, slot 1 kills 71717'."""
+    out = []
+    sp = match.get("squad_placed")
+    if sp is not None and not (1 <= sp <= 20):
+        out.append(f"placement {sp}")
+    for p in match["players"]:
+        if (p.get("damage") or 0) > _MAX_DAMAGE:
+            out.append(f"slot {p['player_slot']} damage {p['damage']}")
+        for k in ("kills", "assists", "knocks", "revive_given", "respawn_given"):
+            if (p.get(k) or 0) > _MAX_COUNT:
+                out.append(f"slot {p['player_slot']} {k} {p[k]}")
+    return ", ".join(out) or "unknown"
+
+
 def fingerprint(players):
     return "fp:" + "_".join(sorted(f"{p['name']}{p['damage']}" for p in players))
 
@@ -844,6 +966,16 @@ class WGCCapture:
         with self._lock:
             return None if self._latest is None else self._latest.copy()
 
+    def grab_with_ts(self):
+        """``(frame, capture_time)`` read together. Deriving the time afterwards
+        from last_frame_age() let a frame that arrived during the banner OCR label
+        the OLDER frame as new, so the stability gate could "confirm" a read with
+        a second read of the same frame."""
+        with self._lock:
+            if self._latest is None:
+                return None, None
+            return self._latest.copy(), self._last_ts
+
     def last_frame_age(self):
         with self._lock:
             return time.time() - self._last_ts if self._last_ts else 1e9
@@ -952,6 +1084,13 @@ class VideoDeviceCapture:
         with self._lock:
             return None if self._latest is None else self._latest.copy()
 
+    def grab_with_ts(self):
+        """``(frame, capture_time)`` read together (see WGCCapture.grab_with_ts)."""
+        with self._lock:
+            if self._latest is None:
+                return None, None
+            return self._latest.copy(), self._last_ts
+
     def last_frame_age(self):
         with self._lock:
             return time.time() - self._last_ts if self._last_ts else 1e9
@@ -1056,7 +1195,7 @@ def ranked_badge_present(frame, cfg, scale):
 def extract_match(frame, cfg, scale):
     header = cfg["header"]
     session_id = ocr_session(crop(frame, scale(header["session_id"])))
-    squad_placed = parse_int(ocr_gold_number(crop(frame, scale(header["squad_placed"]))))
+    squad_placed = read_squad_placed(frame, cfg, scale)
     total_kills = parse_int(ocr_gold_number(crop(frame, scale(header["total_kills"]))))
 
     rows = cfg["rows"]
@@ -1087,6 +1226,14 @@ def extract_match(frame, cfg, scale):
             "revive_given": revive,
             "respawn_given": respawn,
         })
+
+    # A lone gold '1' doesn't OCR (the recognizer returns CJK / punctuation), so every
+    # 1-kill game logged total_squad_kills NULL (83 of 87 by 2026-10). Where the total
+    # was read it equals the players' kills (691 of 694 matches), so fill it in - only
+    # when the header gave nothing, never over a value that was read. Done here, before
+    # any fingerprint, so the two confirming reads stay identical.
+    if total_kills is None and players and all(p["kills"] is not None for p in players):
+        total_kills = sum(p["kills"] for p in players)
 
     return {
         "session_id": session_id,
@@ -1126,17 +1273,37 @@ def csv_path(cfg):
     return p if os.path.isabs(p) else os.path.join(HERE, p)
 
 
+def _csv_spool_path(path):
+    """Side file holding rows that couldn't be appended to *path* yet."""
+    root, ext = os.path.splitext(path)
+    return f"{root}_unsaved{ext or '.csv'}"
+
+
+def _read_csv_rows(path):
+    """All rows of a CSV as dicts; [] when it doesn't exist."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
 def already_logged_ids(path):
     """Dedup keys for matches already in the CSV. For each match (its 3 rows share a
     session_id) it adds both the stat fingerprint and the normalized session id, so a
     match already logged - even under a differently-OCR'd id - is recognized. Count
     distinct matches via the 'stat:' keys."""
     seen = set()
-    if not os.path.exists(path):
-        return seen
     groups = {}
-    with open(path, "r", newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
+    # Rows still waiting in the side file (CSV was locked) count as logged too, or
+    # a restart while the summary is still up would log the match a second time.
+    for p in (path, _csv_spool_path(path)):
+        try:
+            rows = _read_csv_rows(p)
+        except (OSError, ValueError, csv.Error) as e:
+            # An unreadable CSV used to stop the watch from starting at all.
+            _note(f"(CSV) couldn't read {os.path.basename(p)} for dedup ({e}); continuing.")
+            continue
+        for row in rows:
             groups.setdefault(row.get("session_id") or "", []).append(row)
     for sid, rows in groups.items():
         sk = sid_norm(sid)
@@ -1186,7 +1353,72 @@ def _ensure_canonical_header(path):
             w.writerow({k: d.get(k, "") for k in CSV_FIELDS})
 
 
+def _row_key(r):
+    return (str(r.get("session_id") or ""), str(r.get("name") or ""), str(r.get("timestamp") or ""))
+
+
+def _unsynced_path(path):
+    """Matches whose Supabase insert failed, one JSON line each, retried later."""
+    root, _ = os.path.splitext(path)
+    return f"{root}_unsynced.jsonl"
+
+
+def _supabase_insert(rows):
+    """Insert one match's rows. Returns True on success. If the project hasn't run
+    supabase_migration_ranked.sql, the `ranked` column is missing and PostgREST
+    rejects the WHOLE insert (PGRST204); then `ranked` is stripped and the insert
+    retried so the core stats still sync (the flag stays CSV-only until the column
+    exists)."""
+    def _insert(rs):
+        # returning="minimal" avoids reading the rows back, so this works under an
+        # insert-only RLS policy (no SELECT granted to anon).
+        _SUPABASE_CLIENT.table("apex_matches").insert(rs, returning="minimal").execute()
+    try:
+        _insert(rows)
+        return True
+    except Exception as e:
+        if "ranked" in str(e) and any("ranked" in r for r in rows):
+            try:
+                _insert([{k: v for k, v in r.items() if k != "ranked"} for r in rows])
+                _note(f"(Supabase) synced {len(rows)} records WITHOUT 'ranked' - run "
+                      f"supabase_migration_ranked.sql to store the ranked flag.")
+                return True
+            except Exception as e2:
+                e = e2
+        _note(f"(Supabase) Error syncing to Supabase: {e}")
+        return False
+
+
+def _sync_unsynced(path):
+    """Retry matches whose earlier insert failed (network drop, Supabase down).
+    Returns True when nothing is left waiting. A retry after an insert that had in
+    fact landed leaves two same-session copies, which the dashboard collapses."""
+    up = _unsynced_path(path)
+    if not os.path.exists(up):
+        return True
+    try:
+        with open(up, "r", encoding="utf-8") as f:
+            groups = [json.loads(line) for line in f if line.strip()]
+    except (OSError, ValueError) as e:
+        _note(f"(Supabase) couldn't read {os.path.basename(up)}: {e}")
+        return False
+    left = [g for g in groups if not _supabase_insert(g)]
+    if len(left) < len(groups):
+        _note(f"(Supabase) synced {len(groups) - len(left)} match(es) that failed earlier.")
+    try:
+        if left:
+            with open(up, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(g) + "\n" for g in left)
+        else:
+            os.remove(up)
+    except OSError as e:
+        _note(f"(Supabase) couldn't update {os.path.basename(up)}: {e}")
+    return not left
+
+
 def append_match(path, match):
+    """Write one match to the CSV and Supabase. Never raises for a sink failure:
+    returns ``(csv_ok, db_ok)`` (``db_ok`` is None without a Supabase client)."""
     new_file = not os.path.exists(path)
     # Timezone-aware local time: .astimezone() attaches this PC's UTC offset, so the
     # Supabase TIMESTAMPTZ column converts it to the CORRECT UTC instant. Without the
@@ -1194,63 +1426,86 @@ def append_match(path, match):
     # in different timezones logged the same match an hour apart. The CSV now shows
     # local time with its offset (e.g. ...-04:00), which is unambiguous too.
     ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    # Only attach `ranked` when detection actually ran (True/False). Left None when
+    # the default-off feature is disabled, so the key is omitted from the Supabase
+    # insert entirely — a project that hasn't run supabase_migration_ranked.sql
+    # keeps syncing fine (no PGRST204).
+    ranked = match.get("ranked")
     supabase_rows = []
-    with _CSV_LOCK:
-        # Upgrade a pre-`ranked` (or otherwise older) file to the full header first,
-        # so appending wider rows can't produce a ragged file the patch step chokes on.
-        if not new_file:
-            _ensure_canonical_header(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-            if new_file:
-                w.writeheader()
+    for p in match["players"]:
+        row_data = {
+            "timestamp": ts,
+            "session_id": match["session_id"],
+            "squad_placed": match["squad_placed"],
+            "total_squad_kills": match["total_squad_kills"],
+            **p,
+        }
+        if ranked is not None:
+            row_data["ranked"] = ranked
+        supabase_rows.append(row_data)
 
-            # Only attach `ranked` when detection actually ran (True/False). Left
-            # None when the default-off feature is disabled, so the key is omitted
-            # from the Supabase insert entirely — a project that hasn't run
-            # supabase_migration_ranked.sql keeps syncing fine (no PGRST204).
-            ranked = match.get("ranked")
-            for p in match["players"]:
-                row_data = {
-                    "timestamp": ts,
-                    "session_id": match["session_id"],
-                    "squad_placed": match["squad_placed"],
-                    "total_squad_kills": match["total_squad_kills"],
-                    **p,
-                }
-                if ranked is not None:
-                    row_data["ranked"] = ranked
-                w.writerow(row_data)
-                supabase_rows.append(row_data)
+    csv_ok = True
+    with _CSV_LOCK:
+        # A CSV that can't be written (open in Excel, which locks it; a bad
+        # re-save) used to raise here, BEFORE the Supabase insert, so the match was
+        # lost from both and the exception ended the watch for the night. Now the
+        # rows wait in a side file that the next successful append merges back,
+        # and the insert below always runs.
+        spool = _csv_spool_path(path)
+        try:
+            # Upgrade a pre-`ranked` (or otherwise older) file to the full header
+            # first, so appending wider rows can't produce a ragged file the patch
+            # step chokes on.
+            if not new_file:
+                _ensure_canonical_header(path)
+            backlog = _read_csv_rows(spool)
+            if backlog and not new_file:
+                # Rows already in the CSV are skipped, so a side file whose delete
+                # failed after an earlier merge can never be merged twice.
+                have = {_row_key(r) for r in _read_csv_rows(path)}
+                backlog = [r for r in backlog if _row_key(r) not in have]
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                if new_file:
+                    w.writeheader()
+                for r in backlog + supabase_rows:
+                    w.writerow(r)
+            if os.path.exists(spool):
+                if backlog:
+                    _note(f"(CSV) merged {len(backlog)} rows saved while the CSV was locked.")
+                try:
+                    os.remove(spool)
+                except OSError:
+                    pass
+        except (OSError, ValueError, csv.Error) as e:
+            csv_ok = False
+            _note(f"(CSV) {os.path.basename(path)} not writable ({e}); match kept in "
+                  f"{os.path.basename(spool)} until it is.")
+            try:
+                spool_new = not os.path.exists(spool)
+                with open(spool, "a", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                    if spool_new:
+                        w.writeheader()
+                    for r in supabase_rows:
+                        w.writerow(r)
+            except OSError as e2:
+                _note(f"(CSV) could not save the match locally either: {e2}")
 
     # Network sync runs outside the CSV lock so it can't block RP-patch threads.
-    if _SUPABASE_CLIENT:
-        def _insert(rows):
-            # returning="minimal" avoids reading the rows back, so this works
-            # under an insert-only RLS policy (no SELECT granted to anon).
-            _SUPABASE_CLIENT.table("apex_matches").insert(
-                rows, returning="minimal").execute()
-        try:
-            _insert(supabase_rows)
-            print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(supabase_rows)} player records.")
-        except Exception as e:
-            # If the project hasn't run supabase_migration_ranked.sql, the `ranked`
-            # column is missing and PostgREST rejects the WHOLE insert (PGRST204).
-            # Don't lose the match over a not-yet-applied migration: strip `ranked`
-            # and retry so the core stats still sync (the flag stays CSV-only until
-            # the column exists).
-            if "ranked" in str(e) and any("ranked" in r for r in supabase_rows):
-                stripped = [{k: v for k, v in r.items() if k != "ranked"}
-                            for r in supabase_rows]
-                try:
-                    _insert(stripped)
-                    print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(stripped)} "
-                          f"records WITHOUT 'ranked' - run supabase_migration_ranked.sql "
-                          f"to store the ranked flag.")
-                except Exception as e2:
-                    print(f"[{datetime.now():%H:%M:%S}] (Supabase) Error syncing to Supabase: {e2}")
-            else:
-                print(f"[{datetime.now():%H:%M:%S}] (Supabase) Error syncing to Supabase: {e}")
+    if not _SUPABASE_CLIENT:
+        return csv_ok, None
+    earlier_ok = _sync_unsynced(path)
+    if _supabase_insert(supabase_rows):
+        print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(supabase_rows)} player records.")
+        return csv_ok, earlier_ok
+    # Keep it for a retry with the next match instead of losing it from the dashboard.
+    try:
+        with open(_unsynced_path(path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(supabase_rows) + "\n")
+    except OSError as e:
+        _note(f"(Supabase) couldn't queue the match for retry: {e}")
+    return csv_ok, False
 
 
 # --------------------------------------------------------------------------- #
@@ -1493,10 +1748,19 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     # those, which earlier slipped through and logged blank-stat rows (e.g. a
     # player with empty kills/assists/knocks). Treat any None stat as "still
     # rendering" and retry. (None is distinct from a legit 0, which reads as 0.)
-    def _row_incomplete(p):
-        return (not p["name"] or p["kills"] is None or p["assists"] is None
-                or p["knocks"] is None or p["damage"] is None)
-    if any(_row_incomplete(p) for p in match["players"]) or match["squad_placed"] is None:
+    # The reason a read can't be logged goes in status["read_reason"] (the return
+    # value stays a bare 'incomplete': both loops treat anything else as "done with
+    # this summary"), so a summary that never logs says why instead of vanishing.
+    missing = []
+    for p in match["players"]:
+        if not p["name"]:
+            missing.append(f"slot {p['player_slot']} name")
+        missing += [f"slot {p['player_slot']} {k}"
+                    for k in ("kills", "assists", "knocks", "damage") if p[k] is None]
+    if match["squad_placed"] is None:
+        missing.append("placement")
+    if missing:
+        status["read_reason"] = "unread: " + ", ".join(missing)
         return "incomplete"
     # Sanity gate: a mid-animation read (the stats roll up when the screen first
     # appears) or a misaligned region can yield physically-impossible values -
@@ -1505,6 +1769,7 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     # the double-log it caused: a garbage read has different stats AND a different
     # session-id than the good read, so dedup can't collapse the two.
     if not _stats_plausible(match):
+        status["read_reason"] = "implausible: " + _implausible_detail(match)
         return "incomplete"
     if not match["session_id"]:
         match["session_id"] = match_key(match)  # persist so restarts dedup
@@ -1514,6 +1779,7 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     fp = stat_fingerprint(match["players"], match["squad_placed"],
                           match["total_squad_kills"])
     if fp in seen or (sk and sk in seen):
+        status["read_reason"] = None
         return "duplicate"
 
     # Stability gate: only log once these exact stats are confirmed by a NEWER
@@ -1530,8 +1796,10 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
         if not confirmed:
             stable["fp"] = fp
             stable["ft"] = frame_ts if frame_ts is not None else 0.0
+            status["read_reason"] = "waiting for a newer frame to confirm the read"
             return "incomplete"
 
+    status["read_reason"] = None
     match["ranked"] = ranked
     # v2 (RP_TRACKING_V2_SPEC §4.2): collect RP evidence for EVERY logged match,
     # pub or ranked. The badge verdict is now only a resolve-time HINT, never a
@@ -1558,17 +1826,32 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
             p["ending_rp"] = None
             p["rp_change"] = None
 
-    append_match(path, match)
+    csv_ok, db_ok = append_match(path, match)
+    status["csv_problem"] = (None if csv_ok else
+                             "CSV locked or unwritable (open in Excel?) - matches are kept in "
+                             f"{os.path.basename(_csv_spool_path(path))} until it can be written.")
+    status["db_problem"] = (None if db_ok is not False else
+                            "Supabase sync failed - the match is saved locally and retried "
+                            "with the next one.")
     seen.add(fp)
     if sk:
         seen.add(sk)
     status["logged_this_run"] += 1
+    # Every roster player in the match without an RP baseline means this match will
+    # get no RP at all - say so next to it rather than leave a silent blank.
+    rostered = [p for p in match["players"] if p["name"] in (cfg_eff.get("known_names") or [])]
+    rp_note = None
+    if rostered and all(p.get("starting_rp") is None for p in rostered):
+        state, detail = _rp_state()
+        rp_note = (f"no RP: {detail}" if state in ("off", "failing")
+                   else "no RP baseline from ALS yet")
     status["last_match"] = {
         "session_id": match["session_id"],
         "placed": match["squad_placed"],
         "total_kills": match["total_squad_kills"],
         "ranked": ranked,  # True / False / None(detection off) - shown by front-ends
         "time": datetime.now().strftime("%H:%M:%S"),
+        "rp_note": rp_note,
         "players": [{"name": p["name"], "kills": p["kills"],
                      "damage": p["damage"]} for p in match["players"]],
     }
@@ -1584,6 +1867,170 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
         _enqueue_rp_pending(match, path)
 
     return "logged"
+
+
+class _SummaryEpisode:
+    """One summary screen, from its first text-confirmed read until it is logged
+    (or recognised as already logged) or leaves the screen.
+
+    A summary that left unlogged used to leave no trace, so misses were noticed
+    hours later with nothing to recover them from. Now the reason is written to the
+    debug log, a failure that persists while the summary is still up is shown in the
+    app (so it can be captured by hand), and a summary that leaves unlogged has its
+    last frame saved to debug/unlogged/ with a note of why. Only frames whose banner
+    TEXT confirmed a summary count, never banner colour alone (it also fires in
+    gameplay). A miss is only reported once final: the summary can come back and log
+    (tabbed away for a moment, or an on-demand re-probe), so it waits CONFIRM_MISS."""
+
+    WARN_AFTER = 15.0     # seconds of failed reads in one hold before the app shows it
+    CONFIRM_MISS = 120.0  # a summary that left unlogged must stay gone this long
+    KEEP = 30             # unlogged frames kept on disk
+
+    def __init__(self, status, emit, dbg):
+        self.status, self.emit, self.dbg = status, emit, dbg
+        self.pending = None  # a summary that left unlogged, waiting out CONFIRM_MISS
+        self._clear()
+
+    def _clear(self):
+        self.started = None
+        self.frame = None
+        self.reads = 0
+        self.reason = None
+        self.warn_since = None
+        self._logged_kind = (None, 0.0)
+
+    def resume(self):
+        """A new hold on the summary began (on-demand re-probe): the warning only
+        counts time spent actually reading it in this hold."""
+        self.warn_since = None
+
+    def read(self, frame, result):
+        """Record one _try_log_match() result for a text-confirmed frame."""
+        now = time.time()
+        if result != "incomplete":
+            if self.pending is not None:
+                self.dbg("  the summary came back and logged; not a miss")
+                self.pending = None
+            if self.status.get("unread_summary"):
+                self.status["unread_summary"] = None
+                self.emit("tick")
+            self._clear()
+            return
+        if self.started is None:
+            self.started = now
+            if self.pending is not None:  # the summary that left came back: one episode
+                self.started = now - self.pending["held"]
+                self.reads = self.pending["reads"]
+                self.pending = None
+        if self.warn_since is None:
+            self.warn_since = now
+        self.frame, self.reads = frame, self.reads + 1
+        reason = self.status.get("read_reason") or "unknown"
+        self.reason = reason
+        # Log on a change of kind (the text before ':') or every 10 s; the values in
+        # a reason ('slot 1 kills 71717') can differ on every read.
+        kind = reason.split(":")[0]
+        if kind != self._logged_kind[0] or now - self._logged_kind[1] >= 10:
+            self.dbg(f"  not logged yet: {reason}")
+            self._logged_kind = (kind, now)
+        if now - self.warn_since >= self.WARN_AFTER and self.status.get("unread_summary") != reason:
+            if not self.status.get("unread_summary"):
+                self.dbg(f"  summary up {now - self.started:.0f}s and still not logging: {reason}")
+            self.status["unread_summary"] = reason
+            self.emit("unread")
+
+    def end(self, why, final=False):
+        """Called while the summary is off screen (repeatedly is fine) and with
+        final=True when the watch stops. Parks an unlogged summary, and reports it
+        once it has stayed gone for CONFIRM_MISS (immediately when final)."""
+        now = time.time()
+        if self.started is not None:
+            if self.pending is not None:
+                self._report(self.pending)
+            self.pending = {"why": why, "left": now, "reason": self.reason, "reads": self.reads,
+                            "held": now - self.started, "frame": self.frame}
+            if self.status.get("unread_summary"):
+                self.status["unread_summary"] = None
+                self.emit("tick")
+            self._clear()
+        if self.pending is not None and (final or now - self.pending["left"] >= self.CONFIRM_MISS):
+            self._report(self.pending)
+            self.pending = None
+
+    def _report(self, p):
+        saved = self._save(p)
+        msg = (f"SUMMARY NOT LOGGED ({p['why']}) after {p['reads']} reads over {p['held']:.0f}s: "
+               f"{p['reason']}" + (f" - frame saved to {saved}" if saved else ""))
+        self.dbg(msg)
+        try:
+            print(f"[{datetime.now():%H:%M:%S}] {msg}")
+        except Exception:
+            pass
+        self.status["missed"] = {"time": datetime.fromtimestamp(p["left"]).strftime("%H:%M:%S"),
+                                 "reason": p["reason"], "frame": saved}
+        self.emit("missed")
+
+    def _save(self, p):
+        try:
+            out_dir = os.path.join(DEBUG_DIR, "unlogged")
+            os.makedirs(out_dir, exist_ok=True)
+            stem = os.path.join(out_dir, f"unlogged_{datetime.fromtimestamp(p['left']):%Y%m%d_%H%M%S}")
+            # imencode + tofile: checked, and safe on a non-ASCII install path.
+            ok, buf = cv2.imencode(".jpg", p["frame"], [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if not ok:
+                raise OSError("JPEG encode failed")
+            buf.tofile(stem + ".jpg")
+            with open(stem + ".json", "w", encoding="utf-8") as f:
+                json.dump({"reason": p["reason"], "ended": p["why"], "reads": p["reads"],
+                           "held_seconds": round(p["held"], 1)}, f, indent=1)
+            frames = sorted(n for n in os.listdir(out_dir) if n.endswith(".jpg"))
+            for old in frames[:-self.KEEP]:
+                for ext in (".jpg", ".json"):
+                    try:
+                        os.remove(os.path.join(out_dir, old[:-4] + ext))
+                    except OSError:
+                        pass
+            return stem + ".jpg"
+        except Exception as e:
+            self.dbg(f"  could not save the unlogged frame: {e}")
+            return None
+
+
+def _report_loop_error(status, emit, dbg, n):
+    """Record an exception from one watch-loop pass. The loops keep running after
+    one (a locked file or a capture hiccup used to end the watch for the night while
+    the app still looked alive). ``n`` counts consecutive failed passes; tracebacks
+    are rate-limited and the GUI shows the error as active until a pass completes."""
+    import traceback
+    exc = sys.exc_info()[1]
+    msg = f"{type(exc).__name__}: {exc}"
+    status["loop_error"] = {"msg": msg, "count": n, "active": True,
+                            "time": datetime.now().strftime("%H:%M:%S")}
+    if n <= 3 or n % 20 == 0:
+        dbg(f"ERROR in watch loop (#{n}): {traceback.format_exc()}")
+        try:
+            print(f"[{datetime.now():%H:%M:%S}] watch loop error #{n}: {msg}")
+        except Exception:
+            pass
+    emit("tick")
+
+
+def _loop_pass_ok(status):
+    """A watch-loop pass completed: an earlier error is no longer active."""
+    err = status.get("loop_error")
+    if err and err.get("active"):
+        err["active"] = False
+
+
+def _episode_error(episode, status):
+    """An exception during a summary that was already being read counts against
+    that summary, so a read that keeps throwing ends up reported like any miss."""
+    if episode.started is not None:
+        try:
+            status["read_reason"] = f"error: {status['loop_error']['msg']}"
+            episode.read(episode.frame, "incomplete")
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1672,6 +2119,7 @@ def _enqueue_rp_pending(match, csv_path_str):
     before, but the sweep keeps the rest indefinitely instead of a 300 s window.
     """
     now = time.time()
+    match_fp = _match_fp(match["squad_placed"], match["total_squad_kills"], match["players"])
     new_records = [{
         "session_id": match["session_id"],
         "name": p["name"],
@@ -1682,6 +2130,11 @@ def _enqueue_rp_pending(match, csv_path_str):
         "ranked_hint": match.get("ranked"),
         "csv_path": csv_path_str,
         "logged_epoch": now,
+        # Lets the Supabase patch find this match's surviving row when the DB's
+        # cross-PC dedup trigger deleted this PC's copy (see _patch_rp_surviving_copy).
+        "damage": p.get("damage"),
+        "kills": p.get("kills"),
+        "match_fp": match_fp,
     } for p in match["players"] if p.get("starting_rp") is not None]
     if not new_records:
         return
@@ -1751,8 +2204,8 @@ def _rp_resolve_sweep():
         if r not in fresh:
             # Expired: RP never propagated within the (generous) window. Leave an
             # honest blank — assume-zero is deprecated (zero-confirm supersedes it).
-            print(f"[{datetime.now():%H:%M:%S}] (ALS) RP expired unresolved for "
-                  f"{r['session_id']} / {r['name']} (left blank).")
+            _note(f"(ALS) RP expired unresolved for {r['session_id']} / {r['name']} "
+                  f"(left blank).")
 
     # Poll the players still awaiting RP so the ledger has a fresh reading; this
     # is the only side effect that feeds new evidence to the resolver.
@@ -1782,6 +2235,7 @@ def _rp_resolve_sweep():
                          zero_confirm_polls=zero_polls, zero_confirm_seconds=zero_secs,
                          chain=chain)
 
+    by_key = {(r.get("session_id"), r.get("name")): r for r in fresh}
     for patch in actions.patches:
         cols = patch["set"]
         # Last-ditch invariants: nothing beyond a believable single-game loss and
@@ -1791,16 +2245,15 @@ def _rp_resolve_sweep():
         chg = cols.get("rp_change")
         end = cols.get("ending_rp")
         if (chg is not None and chg < loss_floor) or (end is not None and end <= 0):
-            print(f"[{datetime.now():%H:%M:%S}] (ALS) BLOCKED implausible RP patch "
-                  f"for {patch['session_id']} / {patch['name']}: {cols} "
-                  f"(left blank).")
+            _note(f"(ALS) BLOCKED implausible RP patch for {patch['session_id']} / "
+                  f"{patch['name']}: {cols} (left blank).")
             continue
         _safe_patch_rp(patch.get("csv_path"), patch["session_id"],
-                       {patch["name"]: cols})
-        print(f"[{datetime.now():%H:%M:%S}] (ALS) RP resolved for "
-              f"{patch['session_id']} / {patch['name']}: {cols}.")
+                       {patch["name"]: cols},
+                       hints={patch["name"]: by_key.get((patch["session_id"], patch["name"]))})
+        _note(f"(ALS) RP resolved for {patch['session_id']} / {patch['name']}: {cols}.")
     for note in actions.notes:
-        print(f"[{datetime.now():%H:%M:%S}] (ALS) {note}")
+        _note(f"(ALS) {note}")
     # Propagation latency (first_changed_ts - logged_epoch) — the tuning
     # instrument for cadence/windows (§4.2). Debug-level; only if enabled.
     if actions.latencies and cfg.get("capture", {}).get("debug_log"):
@@ -1837,18 +2290,19 @@ def _rp_resolve_sweep():
                 print(f"[{datetime.now():%H:%M:%S}] (ALS) chain save failed - {exc}")
 
 
-def _safe_patch_rp(csv_path_str, session_id, resolved):
+def _safe_patch_rp(csv_path_str, session_id, resolved, hints=None):
     """Apply a resolved-RP patch to both the CSV and Supabase, isolating each so a
     failure in one (e.g. a CSV rewrite hiccup) is logged but never aborts the
-    resolver thread or skips the other sink."""
+    resolver thread or skips the other sink. ``hints`` is ``{name: pending
+    record}`` (damage/kills/logged_epoch) for the Supabase fallback."""
     try:
         _patch_rp_in_csv(csv_path_str, session_id, resolved)
     except Exception as e:
-        print(f"[{datetime.now():%H:%M:%S}] (ALS) CSV RP patch failed for {session_id}: {e}")
+        _note(f"(ALS) CSV RP patch failed for {session_id}: {e}")
     try:
-        _patch_rp_in_supabase(session_id, resolved)
+        _patch_rp_in_supabase(session_id, resolved, hints)
     except Exception as e:
-        print(f"[{datetime.now():%H:%M:%S}] (ALS) Supabase RP patch failed for {session_id}: {e}")
+        _note(f"(ALS) Supabase RP patch failed for {session_id}: {e}")
 
 
 def _patch_rp_in_csv(csv_path_str, session_id, resolved):
@@ -1857,49 +2311,68 @@ def _patch_rp_in_csv(csv_path_str, session_id, resolved):
     *resolved* is ``{name: {col: val}}`` where ``col`` is any of ``ending_rp`` /
     ``rp_change`` / ``ranked`` — only the columns present are written, so a real
     value is never overwritten with a fabricated one. Only rows whose
-    ``session_id`` matches are touched.
+    ``session_id`` matches are touched. Rows still waiting in the side file (the
+    CSV was locked when they logged) are patched there, so they merge back with RP.
     """
-    if not os.path.exists(csv_path_str):
-        return
     # Hold the lock across the whole read-modify-rewrite so a concurrent
     # append_match() (or another patch thread) can't clobber the file.
     with _CSV_LOCK:
-        # Normalize the header first so an older/ragged file reads cleanly (no None
-        # restkey) and writes back against the canonical schema.
-        _ensure_canonical_header(csv_path_str)
-        with open(csv_path_str, "r", newline="", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            fieldnames = list(reader.fieldnames or [])
-            rows = list(reader)
-        if not fieldnames:
-            return  # empty / headerless file, nothing to patch
-        changed = False
-        for row in rows:
-            row.pop(None, None)  # defensive: drop any ragged extra-value restkey
-            if row.get("session_id") == session_id and row.get("name") in resolved:
-                for col, val in resolved[row["name"]].items():
-                    row[col] = val
-                changed = True
-        if not changed:
-            return
-        # Ensure every canonical column exists in the header even if the file predates it.
-        for col in CSV_FIELDS:
-            if col not in fieldnames:
-                fieldnames.append(col)
-        # Atomic rewrite: write a temp file then os.replace() it over the real
-        # path, so a crash/kill mid-write (e.g. app closed while a resolver is
-        # patching) can never leave a truncated apex_matches.csv.
-        tmp = csv_path_str + ".tmp"
-        with open(tmp, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(rows)
-            f.flush()
-            os.fsync(f.fileno())
+        err = None
+        for p in (csv_path_str, _csv_spool_path(csv_path_str)):
+            if os.path.exists(p):
+                try:
+                    _patch_rp_in_csv_file(p, session_id, resolved)
+                except Exception as e:  # one locked file mustn't block the other
+                    err = err or e
+        if err:
+            raise err
+
+
+def _patch_rp_in_csv_file(csv_path_str, session_id, resolved):
+    """One file's read-modify-rewrite for _patch_rp_in_csv (caller holds _CSV_LOCK)."""
+    # Normalize the header first so an older/ragged file reads cleanly (no None
+    # restkey) and writes back against the canonical schema.
+    _ensure_canonical_header(csv_path_str)
+    with open(csv_path_str, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if not fieldnames:
+        return  # empty / headerless file, nothing to patch
+    changed = False
+    for row in rows:
+        row.pop(None, None)  # defensive: drop any ragged extra-value restkey
+        if row.get("session_id") == session_id and row.get("name") in resolved:
+            for col, val in resolved[row["name"]].items():
+                row[col] = val
+            changed = True
+    if not changed:
+        return
+    # Ensure every canonical column exists in the header even if the file predates it.
+    for col in CSV_FIELDS:
+        if col not in fieldnames:
+            fieldnames.append(col)
+    # Atomic rewrite: write a temp file then os.replace() it over the real
+    # path, so a crash/kill mid-write (e.g. app closed while a resolver is
+    # patching) can never leave a truncated apex_matches.csv.
+    tmp = csv_path_str + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
         os.replace(tmp, csv_path_str)
+    except OSError:
+        try:
+            os.remove(tmp)  # e.g. the CSV is open in Excel: don't leave .tmp behind
+        except OSError:
+            pass
+        raise
 
 
-def _patch_rp_in_supabase(session_id, resolved):
+def _patch_rp_in_supabase(session_id, resolved, hints=None):
     """Update Supabase rows with the resolved columns.
 
     *resolved* is ``{name: {col: val}}`` where ``col`` is any of ``ending_rp`` /
@@ -1913,7 +2386,7 @@ def _patch_rp_in_supabase(session_id, resolved):
         if not cols:
             continue
         try:
-            _SUPABASE_CLIENT.table("apex_matches").update(dict(cols)) \
+            resp = _SUPABASE_CLIENT.table("apex_matches").update(dict(cols)) \
                 .eq("session_id", session_id).eq("name", name).execute()
         except Exception as e:
             # Friend builds patch on the scoped anon key. Until
@@ -1921,17 +2394,87 @@ def _patch_rp_in_supabase(session_id, resolved):
             # update including `ranked` is rejected — retry without it so the
             # RP columns still land (the flag stays until the migration runs).
             retry = {k: v for k, v in cols.items() if k != "ranked"}
-            if "ranked" in cols and retry:
+            if "ranked" in cols and retry and "ranked" in str(e):
                 try:
                     _SUPABASE_CLIENT.table("apex_matches").update(retry) \
                         .eq("session_id", session_id).eq("name", name).execute()
-                    print(f"[{datetime.now():%H:%M:%S}] (Supabase) RP patch for {name} "
-                          f"synced WITHOUT 'ranked' - run supabase_migration_rp_v2.sql "
-                          f"to let the resolver update the ranked flag.")
+                    _note(f"(Supabase) RP patch for {name} synced WITHOUT 'ranked' - run "
+                          f"supabase_migration_rp_v2.sql to let the resolver update the "
+                          f"ranked flag.")
                     continue
                 except Exception as e2:
                     e = e2
-            print(f"[{datetime.now():%H:%M:%S}] (Supabase) RP patch error for {name}: {e}")
+            _note(f"(Supabase) RP patch error for {name}: {e}")
+            continue
+        # Only the service key can read rows back; on the anon key an update that
+        # worked returns no rows too, so "0 rows" means something only here.
+        if _SUPABASE_IS_SERVICE and not (resp.data or []):
+            try:
+                _patch_rp_surviving_copy(session_id, name, cols, (hints or {}).get(name))
+            except Exception as e:
+                _note(f"(Supabase) surviving-copy RP patch failed for {name} / {session_id}: {e}")
+
+
+def _match_fp(squad_placed, total_squad_kills, rows):
+    """The dedup trigger's content fingerprint of one match (placement | total
+    kills | sorted damage:kills), with a NULL total read as sum(kills) the way
+    supabase_dedup_v2.sql and the dashboard do. None for a match with no damage,
+    which is too featureless to identify."""
+    if not rows or not sum(r.get("damage") or 0 for r in rows):
+        return None
+    tk = total_squad_kills
+    if tk is None:
+        tk = sum(r.get("kills") or 0 for r in rows)
+    pairs = ",".join(sorted(f"{r.get('damage') or 0}:{r.get('kills') or 0}" for r in rows))
+    return f"{'' if squad_placed is None else squad_placed}|{tk}|{pairs}"
+
+
+def _patch_rp_surviving_copy(session_id, name, cols, hint):
+    """RP patch fallback for when this PC's copy of a match no longer exists.
+
+    When two squadmates' trackers log the same game, the DB dedup trigger
+    (supabase_dedup.sql) keeps the first copy and DELETES the later one, so this
+    PC's patch by its own session id matched 0 rows and the match kept NULL RP with
+    no error (the other copy often comes from a PC without RP). The trigger only
+    deletes on an identical content fingerprint, so the survivor is found the same
+    way: exactly one OTHER session within 15 min whose fingerprint equals this
+    match's. Within it the player is matched by name, else by a damage:kills pair
+    unique in that session. Only blank RP is ever written."""
+    if not hint or not hint.get("match_fp") or hint.get("logged_epoch") is None:
+        _note(f"(Supabase) RP patch for {name} / {session_id} matched 0 rows "
+              f"(no match fingerprint to find another copy; left blank).")
+        return
+    t0 = hint["logged_epoch"]
+    lo = datetime.fromtimestamp(t0 - 900, timezone.utc).isoformat()
+    hi = datetime.fromtimestamp(t0 + 900, timezone.utc).isoformat()
+    rows = (_SUPABASE_CLIENT.table("apex_matches")
+            .select("id,session_id,name,damage,kills,squad_placed,total_squad_kills,rp_change")
+            .gte("timestamp", lo).lte("timestamp", hi).execute().data or [])
+    sessions = {}
+    for r in rows:
+        if r.get("session_id") != session_id:
+            sessions.setdefault(r["session_id"], []).append(r)
+    same = [rs for rs in sessions.values()
+            if _match_fp(rs[0].get("squad_placed"), rs[0].get("total_squad_kills"), rs)
+            == hint["match_fp"]]
+    if len(same) != 1:
+        _note(f"(Supabase) RP patch for {name} / {session_id} matched 0 rows and "
+              f"{len(same)} other copies of the match; left blank.")
+        return
+    mates = same[0]
+    row = next((r for r in mates if r.get("name") == name), None)
+    if row is None:  # the other PC OCR'd the name differently ('ullvautnunter')
+        pair = [r for r in mates
+                if (r.get("damage"), r.get("kills")) == (hint.get("damage"), hint.get("kills"))]
+        row = pair[0] if len(pair) == 1 else None
+    if row is None or row.get("rp_change") is not None:
+        _note(f"(Supabase) RP patch for {name} / {session_id}: no unambiguous blank row in "
+              f"the surviving copy {mates[0]['session_id']}; left blank.")
+        return
+    _SUPABASE_CLIENT.table("apex_matches").update(dict(cols)) \
+        .eq("id", row["id"]).is_("rp_change", "null").execute()
+    _note(f"(Supabase) RP for {name} written to the surviving copy {row['session_id']} "
+          f"(this PC's copy {session_id} was removed as a cross-PC duplicate).")
 
 
 def _rank_status_lines():
@@ -1997,6 +2540,7 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     (don't touch widgets directly). Returns the count logged this run.
     """
     import threading as _th
+    global _DIAG
     stop_event = stop_event or _th.Event()
     sync_roster_to_supabase(cfg)
     # (Re)build the ALS rank tracker from the current config so an API key / roster
@@ -2010,6 +2554,7 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     _ensure_rp_resolver()
     forced = forced_res or cfg.get("force_resolution") or None
     path = csv_path(cfg)
+    _DIAG = _make_debug_logger(cfg, header=False)  # so the dedup read below can report
     seen = already_logged_ids(path)
     poll = cfg.get("poll_seconds", 1.0)
     # A frame is only "stale" once it's older than the capture interval plus a
@@ -2025,7 +2570,14 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
               "last_match": None, "csv_path": path, "resolution": None,
               "profile": None, "match_ranked": False, "event": "start",
               # Per-player live rank + session RP (§4.3); refreshed on heartbeat.
-              "players_rp": [], "rp_untracked": [], "rp_stuck": []}
+              "players_rp": [], "rp_untracked": [], "rp_stuck": [],
+              # RP tracking health ('off'/'starting'/'ok'/'failing', detail), why the
+              # current summary isn't logging, a summary that is on screen but has
+              # failed to log for a while, the last summary that never logged, the
+              # last exception a loop pass survived ({msg, count, active, time}), and
+              # a CSV / Supabase write that is failing.
+              "rp_state": _rp_state(), "read_reason": None, "unread_summary": None,
+              "missed": None, "loop_error": None, "csv_problem": None, "db_problem": None}
 
     def emit(event):
         status["event"] = event
@@ -2061,7 +2613,12 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
         poll = cfg.get("obs_poll_seconds", 0.3)
 
     dbg = _make_debug_logger(cfg)
+    _DIAG = dbg
     dbg(f"continuous watch started; mode={cap_mode} poll={poll}s csv={path}")
+    dbg("RP tracking: %s%s" % (status["rp_state"][0],
+                               f" ({status['rp_state'][1]})" if status["rp_state"][1] else ""))
+    episode = _SummaryEpisode(status, emit, dbg)
+    errors = 0
     cap, src, hwnd = open_live_capture(cfg)
     status["src"] = src
     got = cap.wait_first(8)
@@ -2094,130 +2651,148 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     stable = {"fp": None, "ft": 0.0}
     try:
         while not stop_event.is_set():
-            age = cap.last_frame_age()
-            status["frame_age"] = age
-            status["state"] = "watching" if age < stale_after else "stale"
-            # Cheaply re-acquire only when needed. During normal play this is just
-            # an IsWindow() check (no expensive window scan), so it won't hitch.
-            # OBS mode checks more often + at a lower staleness threshold: a frozen
-            # virtual-camera feed is the ONLY failure signal there (no window to
-            # probe), and a slow recovery is exactly how a summary gets missed —
-            # the feed stalled ~65s once and a game didn't log. Faster recovery
-            # (re-acquire within ~8-12s) catches the summary while it's still up.
-            recheck_every = 8 if cap_mode == "obs" else 30
-            stale_reacquire = 12 if cap_mode == "obs" else 20
-            if time.time() - last_recheck > recheck_every:
-                last_recheck = time.time()
-                if cap_mode == "obs":
-                    # OBS reads a virtual camera, NOT the Apex window — so a missing
-                    # game window is normal (e.g. tracking on a separate stream PC
-                    # where the game isn't running). Re-acquire only when the feed
-                    # actually goes stale, never just because there's no hwnd.
-                    need_reacquire = cap.last_frame_age() > stale_reacquire
-                else:
-                    alive = hwnd is not None and _user32.IsWindow(hwnd)
-                    need_reacquire = (not alive) or cap.last_frame_age() > 20
-                if need_reacquire:
-                    cap.release()
-                    cap, src, hwnd = open_live_capture(cfg)
-                    status["src"] = src
-                    dbg(f"re-acquired capture -> {src}")
-                    emit("reacquire")
-            # Heartbeat tick so a front-end can show it is alive and capturing.
-            if hb_secs and time.time() - last_hb >= hb_secs:
-                last_hb = time.time()
-                status["players_rp"] = _rank_status_lines()          # §4.3
-                status["rp_untracked"] = (_RANK_TRACKER.unresolved_names()
-                                          if _RANK_TRACKER is not None else [])
-                status["rp_stuck"] = _pending_status_lines(
-                    cfg.get("rp_pending_warn_seconds", 600))
-                emit("heartbeat")
-            else:
-                emit("tick")
-
-            frame = cap.grab()
-            if frame is None:
-                stop_event.wait(poll)
-                continue
-            h, w = frame.shape[:2]
-            cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
-            scale = scaler(cfg_eff, w, h)
-            if not announced:
-                announced = True
-                status["resolution"] = f"{w}x{h}"
-                status["profile"] = prof_key
-                emit("announce")
-                dbg(f"resolution {w}x{h}, profile={prof_key or '(scaled base)'}")
-
-            # Cheap OCR-free gate every poll. OCR + extraction only happen once per
-            # summary, after it has been on screen long enough to finish rendering.
-            if not banner_color_present(frame, cfg_eff, scale):
-                if absent_since is None:
-                    absent_since = time.time()
-                # Only arm for a NEW summary once the banner has been gone a few
-                # seconds. A brief 1-frame colour flicker on the same summary must not
-                # reset summary_handled, or the match gets read and logged twice.
-                if time.time() - absent_since >= 3.0:
-                    if banner_logged:
-                        dbg("banner gone; re-armed for next summary")
-                    summary_handled = False
-                    banner_since = None
-                    banner_logged = False
-                    stable["fp"] = None  # fresh stability tracking next summary
-                # We're off the summary (gameplay/lobby) — the only time the rank
-                # badge is on screen. Throttle-check it and latch on two consecutive
-                # hits. Reuses this already-grabbed frame, so it adds no capture.
-                if ranked_enabled and not match_ranked and \
-                        time.time() - last_ranked_check >= ranked_check_secs:
-                    last_ranked_check = time.time()
-                    if ranked_badge_present(frame, cfg_eff, scale):
-                        ranked_confirm += 1
-                        if ranked_confirm >= 2:
-                            match_ranked = True
-                            status["match_ranked"] = True
-                            emit("ranked")  # live "badge grabbed" signal for front-ends
-                            dbg("ranked badge confirmed; match flagged RANKED")
+            failed = False
+            try:
+                age = cap.last_frame_age()
+                status["frame_age"] = age
+                status["state"] = "watching" if age < stale_after else "stale"
+                # Cheaply re-acquire only when needed. During normal play this is just
+                # an IsWindow() check (no expensive window scan), so it won't hitch.
+                # OBS mode checks more often + at a lower staleness threshold: a frozen
+                # virtual-camera feed is the ONLY failure signal there (no window to
+                # probe), and a slow recovery is exactly how a summary gets missed —
+                # the feed stalled ~65s once and a game didn't log. Faster recovery
+                # (re-acquire within ~8-12s) catches the summary while it's still up.
+                recheck_every = 8 if cap_mode == "obs" else 30
+                stale_reacquire = 12 if cap_mode == "obs" else 20
+                if time.time() - last_recheck > recheck_every:
+                    last_recheck = time.time()
+                    if cap_mode == "obs":
+                        # OBS reads a virtual camera, NOT the Apex window — so a missing
+                        # game window is normal (e.g. tracking on a separate stream PC
+                        # where the game isn't running). Re-acquire only when the feed
+                        # actually goes stale, never just because there's no hwnd.
+                        need_reacquire = cap.last_frame_age() > stale_reacquire
                     else:
-                        ranked_confirm = 0
-                stop_event.wait(poll)
-                continue
-            absent_since = None
-            if banner_since is None:
-                banner_since = time.time()
-            if not banner_logged:
-                banner_logged = True
-                dbg("BANNER COLOUR seen; settling before read")
-            if summary_handled:
-                stop_event.wait(poll)
-                continue
-            # Let the screen settle so placement/total/stats are fully drawn.
-            if time.time() - banner_since < settle:
-                stop_event.wait(poll)
-                continue
-            if not banner_text_present(frame, cfg_eff, scale):
-                stop_event.wait(poll)   # banner colour but not a summary banner
-                continue
+                        alive = hwnd is not None and _user32.IsWindow(hwnd)
+                        need_reacquire = (not alive) or cap.last_frame_age() > 20
+                    if need_reacquire:
+                        cap.release()
+                        cap, src, hwnd = open_live_capture(cfg)
+                        status["src"] = src
+                        dbg(f"re-acquired capture -> {src}")
+                        emit("reacquire")
+                # Heartbeat tick so a front-end can show it is alive and capturing.
+                if hb_secs and time.time() - last_hb >= hb_secs:
+                    last_hb = time.time()
+                    status["players_rp"] = _rank_status_lines()          # §4.3
+                    status["rp_untracked"] = (_RANK_TRACKER.unresolved_names()
+                                              if _RANK_TRACKER is not None else [])
+                    status["rp_stuck"] = _pending_status_lines(
+                        cfg.get("rp_pending_warn_seconds", 600))
+                    rp_state = _rp_state()
+                    if rp_state != status["rp_state"]:
+                        dbg(f"RP tracking: {rp_state[0]}" + (f" ({rp_state[1]})" if rp_state[1] else ""))
+                    status["rp_state"] = rp_state
+                    emit("heartbeat")
+                else:
+                    emit("tick")
 
-            result = _try_log_match(frame, cfg_eff, scale, path, seen,
-                                    status, emit, log_cb,
-                                    ranked=(match_ranked if ranked_enabled else None),
-                                    stable=stable,
-                                    frame_ts=time.time() - cap.last_frame_age())
-            if result != "incomplete":
-                summary_handled = True  # this summary instance is now processed
-                stable["fp"] = None     # done with this summary; reset stability
-                # Latch consumed for this match — reset for the next one. (Can't
-                # reset in the banner-absent branch above: that runs every gameplay
-                # frame and would wipe the detection before the summary is read.)
-                match_ranked = False
-                ranked_confirm = 0
-                last_ranked_check = 0.0
-                status["match_ranked"] = False
-                dbg(f"read result: {result}"
-                    + (f" (now {status['logged_this_run']} logged this run)"
-                       if result == "logged" else ""))
-            stop_event.wait(poll)
+                frame, frame_ts = cap.grab_with_ts()
+                if frame is None:
+                    stop_event.wait(poll)
+                    continue
+                h, w = frame.shape[:2]
+                cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
+                scale = scaler(cfg_eff, w, h)
+                if not announced:
+                    announced = True
+                    status["resolution"] = f"{w}x{h}"
+                    status["profile"] = prof_key
+                    emit("announce")
+                    dbg(f"resolution {w}x{h}, profile={prof_key or '(scaled base)'}")
+
+                # Cheap OCR-free gate every poll. OCR + extraction only happen once per
+                # summary, after it has been on screen long enough to finish rendering.
+                if not banner_color_present(frame, cfg_eff, scale):
+                    if absent_since is None:
+                        absent_since = time.time()
+                    # Only arm for a NEW summary once the banner has been gone a few
+                    # seconds. A brief 1-frame colour flicker on the same summary must not
+                    # reset summary_handled, or the match gets read and logged twice.
+                    if time.time() - absent_since >= 3.0:
+                        episode.end("summary left the screen")
+                        if banner_logged:
+                            dbg("banner gone; re-armed for next summary")
+                        summary_handled = False
+                        banner_since = None
+                        banner_logged = False
+                        stable["fp"] = None  # fresh stability tracking next summary
+                    # We're off the summary (gameplay/lobby) — the only time the rank
+                    # badge is on screen. Throttle-check it and latch on two consecutive
+                    # hits. Reuses this already-grabbed frame, so it adds no capture.
+                    if ranked_enabled and not match_ranked and \
+                            time.time() - last_ranked_check >= ranked_check_secs:
+                        last_ranked_check = time.time()
+                        if ranked_badge_present(frame, cfg_eff, scale):
+                            ranked_confirm += 1
+                            if ranked_confirm >= 2:
+                                match_ranked = True
+                                status["match_ranked"] = True
+                                emit("ranked")  # live "badge grabbed" signal for front-ends
+                                dbg("ranked badge confirmed; match flagged RANKED")
+                        else:
+                            ranked_confirm = 0
+                    stop_event.wait(poll)
+                    continue
+                absent_since = None
+                if banner_since is None:
+                    banner_since = time.time()
+                if not banner_logged:
+                    banner_logged = True
+                    dbg("BANNER COLOUR seen; settling before read")
+                if summary_handled:
+                    stop_event.wait(poll)
+                    continue
+                # Let the screen settle so placement/total/stats are fully drawn.
+                if time.time() - banner_since < settle:
+                    stop_event.wait(poll)
+                    continue
+                if not banner_text_present(frame, cfg_eff, scale):
+                    stop_event.wait(poll)   # banner colour but not a summary banner
+                    continue
+
+                result = _try_log_match(frame, cfg_eff, scale, path, seen,
+                                        status, emit, log_cb,
+                                        ranked=(match_ranked if ranked_enabled else None),
+                                        stable=stable, frame_ts=frame_ts)
+                episode.read(frame, result)
+                if result != "incomplete":
+                    summary_handled = True  # this summary instance is now processed
+                    stable["fp"] = None     # done with this summary; reset stability
+                    # Latch consumed for this match — reset for the next one. (Can't
+                    # reset in the banner-absent branch above: that runs every gameplay
+                    # frame and would wipe the detection before the summary is read.)
+                    match_ranked = False
+                    ranked_confirm = 0
+                    last_ranked_check = 0.0
+                    status["match_ranked"] = False
+                    dbg(f"read result: {result}"
+                        + (f" (now {status['logged_this_run']} logged this run)"
+                           if result == "logged" else ""))
+                stop_event.wait(poll)
+            except Exception:
+                failed = True
+                errors += 1
+                _report_loop_error(status, emit, dbg, errors)
+                _episode_error(episode, status)
+                stop_event.wait(min(30.0, poll * 2 ** min(errors, 5)))
+            finally:
+                if not failed:  # also runs on every `continue`: the pass completed
+                    errors = 0
+                    _loop_pass_ok(status)
     finally:
+        episode.end("watch stopped", final=True)
         cap.release()
         dbg("continuous watch stopped")
         status["state"] = "stopped"
@@ -2262,10 +2837,16 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
     normal poll cadence until the screen settles enough to log (you're on the
     summary by then, so a brief active capture is fine), then close and idle again.
     """
+    global _DIAG
     idle_probe = cfg.get("capture", {}).get("idle_probe_seconds", 8)
     dbg = _make_debug_logger(cfg)
+    _DIAG = dbg
     dbg(f"on-demand watch started; idle_probe={idle_probe}s settle={settle_seconds}s "
         f"poll={poll}s csv={path}")
+    dbg("RP tracking: %s%s" % (status["rp_state"][0],
+                               f" ({status['rp_state'][1]})" if status["rp_state"][1] else ""))
+    episode = _SummaryEpisode(status, emit, dbg)
+    errors = 0
     announced = False
     last_hb = time.time()
     # Ranked-badge latch (see run_watch). Here the check rides each idle probe
@@ -2286,113 +2867,142 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
                                       if _RANK_TRACKER is not None else [])
             status["rp_stuck"] = _pending_status_lines(
                 cfg.get("rp_pending_warn_seconds", 600))
+            rp_state = _rp_state()
+            if rp_state != status["rp_state"]:
+                dbg(f"RP tracking: {rp_state[0]}" + (f" ({rp_state[1]})" if rp_state[1] else ""))
+            status["rp_state"] = rp_state
             emit("heartbeat")
         else:
             emit("tick")
 
     probe_n = 0
-    while not stop_event.is_set():
-        probe_n += 1
-        t_open = time.time()
-        cap, src, hwnd = open_live_capture(cfg)
-        status["src"] = src
-        got = cap.wait_first(5)
-        frame = cap.grab() if got else None
-        open_ms = (time.time() - t_open) * 1000
-        if frame is None:
-            cap.release()
-            status["state"] = "waiting"
-            status["frame_age"] = None
-            dbg(f"probe #{probe_n}: NO FRAME from {src} after {open_ms:.0f}ms "
-                f"(Apex visible?); released, idling {idle_probe}s")
-            heartbeat_or_tick()
-            stop_event.wait(idle_probe)
-            continue
-
-        h, w = frame.shape[:2]
-        cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
-        scale = scaler(cfg_eff, w, h)
-        if not announced:
-            announced = True
-            status["resolution"] = f"{w}x{h}"
-            status["profile"] = prof_key
-            emit("announce")
-            dbg(f"resolution {w}x{h}, profile={prof_key or '(scaled base)'}")
-        status["state"] = "watching"
-        status["frame_age"] = cap.last_frame_age()
-
-        if not banner_color_present(frame, cfg_eff, scale):
-            # Gameplay probe — check the rank badge on this frame before dropping
-            # the session, latching on two consecutive hits (same as run_watch).
-            if ranked_enabled and not match_ranked and \
-                    time.time() - last_ranked_check >= ranked_check_secs:
-                last_ranked_check = time.time()
-                if ranked_badge_present(frame, cfg_eff, scale):
-                    ranked_confirm += 1
-                    if ranked_confirm >= 2:
-                        match_ranked = True
-                        status["match_ranked"] = True
-                        emit("ranked")  # live "badge grabbed" signal for front-ends
-                        dbg("ranked badge confirmed; match flagged RANKED")
-                else:
-                    ranked_confirm = 0
-            # No end screen - drop the session immediately. This is the clean,
-            # zero-capture gameplay window where the game runs stutter-free.
-            cap.release()
-            dbg(f"probe #{probe_n}: {src} {w}x{h}, open+grab {open_ms:.0f}ms, "
-                f"no banner -> released, idling {idle_probe}s (capture OFF)")
-            heartbeat_or_tick()
-            stop_event.wait(idle_probe)
-            continue
-
-        # Possible end screen: keep THIS session open and read at the normal
-        # cadence until it settles and we can log it.
-        dbg(f"probe #{probe_n}: BANNER COLOUR seen -> holding session open to read")
-        banner_since = time.time()
-        stable["fp"] = None  # fresh stability tracking for this summary
+    try:
         while not stop_event.is_set():
-            frame = cap.grab()
-            if frame is None:
-                stop_event.wait(poll)
-                continue
-            status["frame_age"] = cap.last_frame_age()
-            if not banner_color_present(frame, cfg_eff, scale):
-                dbg("  banner gone before read completed; back to idle")
-                break  # banner gone before we could read it; back to idle probing
-            if time.time() - banner_since < settle_seconds:
-                stop_event.wait(poll)
-                continue
-            if not banner_text_present(frame, cfg_eff, scale):
-                dbg("  banner colour but text not a summary; retrying")
-                stop_event.wait(poll)   # banner colour but not a summary banner
-                continue
-            result = _try_log_match(frame, cfg_eff, scale, path, seen,
-                                    status, emit, log_cb,
-                                    ranked=(match_ranked if ranked_enabled else None),
-                                    stable=stable,
-                                    frame_ts=time.time() - cap.last_frame_age())
-            dbg(f"  read result: {result}"
-                + (f" (now {status['logged_this_run']} logged this run)"
-                   if result == "logged" else ""))
-            if result != "incomplete":
-                stable["fp"] = None     # done with this summary; reset stability
-                # Latch consumed for this match; reset for the next one.
-                match_ranked = False
-                ranked_confirm = 0
-                last_ranked_check = 0.0
-                status["match_ranked"] = False
-                break   # logged or already-seen; stop reading this summary
-            stop_event.wait(poll)     # still animating in; retry
-        cap.release()
-        dbg(f"probe #{probe_n}: released after summary read, idling {idle_probe}s (capture OFF)")
-        # Idle again. If we just logged, this also waits out part of the summary
-        # so the next probe doesn't immediately re-read the same (now deduped)
-        # screen more than necessary.
-        stop_event.wait(idle_probe)
+            probe_n += 1
+            cap = None
+            failed = False
+            try:
+                t_open = time.time()
+                cap, src, hwnd = open_live_capture(cfg)
+                status["src"] = src
+                got = cap.wait_first(5)
+                frame = cap.grab() if got else None
+                open_ms = (time.time() - t_open) * 1000
+                if frame is None:
+                    cap.release()
+                    episode.end("capture lost")
+                    status["state"] = "waiting"
+                    status["frame_age"] = None
+                    dbg(f"probe #{probe_n}: NO FRAME from {src} after {open_ms:.0f}ms "
+                        f"(Apex visible?); released, idling {idle_probe}s")
+                    heartbeat_or_tick()
+                    stop_event.wait(idle_probe)
+                    continue
 
-    dbg("on-demand watch stopped")
-    status["state"] = "stopped"
-    emit("stop")
+                h, w = frame.shape[:2]
+                cfg_eff, prof_key = apply_profile(cfg, w, h, forced)
+                scale = scaler(cfg_eff, w, h)
+                if not announced:
+                    announced = True
+                    status["resolution"] = f"{w}x{h}"
+                    status["profile"] = prof_key
+                    emit("announce")
+                    dbg(f"resolution {w}x{h}, profile={prof_key or '(scaled base)'}")
+                status["state"] = "watching"
+                status["frame_age"] = cap.last_frame_age()
+
+                if not banner_color_present(frame, cfg_eff, scale):
+                    # Gameplay probe — check the rank badge on this frame before dropping
+                    # the session, latching on two consecutive hits (same as run_watch).
+                    if ranked_enabled and not match_ranked and \
+                            time.time() - last_ranked_check >= ranked_check_secs:
+                        last_ranked_check = time.time()
+                        if ranked_badge_present(frame, cfg_eff, scale):
+                            ranked_confirm += 1
+                            if ranked_confirm >= 2:
+                                match_ranked = True
+                                status["match_ranked"] = True
+                                emit("ranked")  # live "badge grabbed" signal for front-ends
+                                dbg("ranked badge confirmed; match flagged RANKED")
+                        else:
+                            ranked_confirm = 0
+                    episode.end("summary left the screen")
+                    # No end screen - drop the session immediately. This is the clean,
+                    # zero-capture gameplay window where the game runs stutter-free.
+                    cap.release()
+                    dbg(f"probe #{probe_n}: {src} {w}x{h}, open+grab {open_ms:.0f}ms, "
+                        f"no banner -> released, idling {idle_probe}s (capture OFF)")
+                    heartbeat_or_tick()
+                    stop_event.wait(idle_probe)
+                    continue
+
+                # Possible end screen: keep THIS session open and read at the normal
+                # cadence until it settles and we can log it.
+                dbg(f"probe #{probe_n}: BANNER COLOUR seen -> holding session open to read")
+                banner_since = time.time()
+                stable["fp"] = None  # fresh stability tracking for this summary
+                episode.resume()
+                while not stop_event.is_set():
+                    frame, frame_ts = cap.grab_with_ts()
+                    if frame is None:
+                        stop_event.wait(poll)
+                        continue
+                    status["frame_age"] = cap.last_frame_age()
+                    if not banner_color_present(frame, cfg_eff, scale):
+                        dbg("  banner gone before read completed; back to idle")
+                        break  # banner gone before we could read it; back to idle probing
+                    if time.time() - banner_since < settle_seconds:
+                        stop_event.wait(poll)
+                        continue
+                    if not banner_text_present(frame, cfg_eff, scale):
+                        dbg("  banner colour but text not a summary; retrying")
+                        stop_event.wait(poll)   # banner colour but not a summary banner
+                        continue
+                    result = _try_log_match(frame, cfg_eff, scale, path, seen,
+                                            status, emit, log_cb,
+                                            ranked=(match_ranked if ranked_enabled else None),
+                                            stable=stable, frame_ts=frame_ts)
+                    episode.read(frame, result)
+                    dbg(f"  read result: {result}"
+                        + (f" (now {status['logged_this_run']} logged this run)"
+                           if result == "logged" else ""))
+                    if result != "incomplete":
+                        stable["fp"] = None     # done with this summary; reset stability
+                        # Latch consumed for this match; reset for the next one.
+                        match_ranked = False
+                        ranked_confirm = 0
+                        last_ranked_check = 0.0
+                        status["match_ranked"] = False
+                        break   # logged or already-seen; stop reading this summary
+                    stop_event.wait(poll)     # still animating in; retry
+                # An unlogged summary stays open across the idle gap: the hold loop
+                # leaves on one banner-less frame and the next probe often finds the
+                # same summary still up and logs it. It ends at the next gameplay probe.
+                cap.release()
+                dbg(f"probe #{probe_n}: released after summary read, idling {idle_probe}s (capture OFF)")
+                # Idle again. If we just logged, this also waits out part of the summary
+                # so the next probe doesn't immediately re-read the same (now deduped)
+                # screen more than necessary.
+                stop_event.wait(idle_probe)
+            except Exception:
+                failed = True
+                errors += 1
+                _report_loop_error(status, emit, dbg, errors)
+                _episode_error(episode, status)
+                if cap is not None:
+                    cap.release()  # never hold capture open through the backoff
+                stop_event.wait(min(120.0, idle_probe * 2 ** min(errors, 3)))
+            finally:
+                if cap is not None:
+                    cap.release()  # idempotent; also covers an exception mid-probe
+                if not failed:
+                    errors = 0
+                    _loop_pass_ok(status)
+    finally:
+        episode.end("watch stopped", final=True)
+        dbg("on-demand watch stopped")
+        status["state"] = "stopped"
+        emit("stop")
     return status["logged_this_run"]
 
 
