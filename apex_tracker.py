@@ -53,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.5"
+__version__ = "1.6.6"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -554,12 +554,54 @@ def parse_int(text):
 
 
 def parse_kak(text):
-    """'5 / 3 / 5' -> (5, 3, 5). Tolerates OCR noise around the slashes."""
-    nums = re.findall(r"\d+", text or "")
-    nums = [int(n) for n in nums[:3]]
+    """'5 / 3 / 5' -> (5, 3, 5). Tolerates OCR noise around the slashes.
+
+    The card's italic slashes can OCR as the digit 1, fusing the whole line into
+    one run ('7 / 7 / 7' -> '71717', seen live 2026-10-25). That read failed the
+    plausibility gate on every retry, so the match was silently never logged.
+    When fewer than three numbers come back, re-split the runs at their 1s - but
+    only when exactly ONE split gives three believable stats. Anything ambiguous
+    stays unread (None) so the caller retries instead of logging a guess."""
+    groups = re.findall(r"\d+", text or "")
+    if len(groups) < 3:
+        fused = _split_fused_kak(groups)
+        if fused:
+            return fused
+    nums = [int(n) for n in groups[:3]]
     while len(nums) < 3:
         nums.append(None)
     return nums[0], nums[1], nums[2]
+
+
+def _split_fused_kak(groups):
+    """The unique (kills, assists, knocks) reading of the digit runs ``groups``
+    with some '1's taken as slashes, or None when there is none or several
+    (e.g. '111111' could be 11/1/1, 1/11/1 or 1/1/11)."""
+    def stat(s):
+        return len(s) <= 2 and (s == "0" or s[0] != "0") and int(s) <= _MAX_COUNT
+
+    def splits(run, parts):
+        # Every way to cut `run` into `parts` stats separated by single '1's.
+        if parts == 1:
+            return [(int(run),)] if stat(run) else []
+        out = []
+        for i in range(1, len(run) - 1):
+            if run[i] == "1" and stat(run[:i]):
+                out += [(int(run[:i]),) + rest for rest in splits(run[i + 1:], parts - 1)]
+        return out
+
+    def combos(gs, parts):
+        # Spread `parts` stats over the runs, each run yielding at least one.
+        if not gs:
+            return [()] if parts == 0 else []
+        out = []
+        for k in range(1, parts - len(gs) + 2):
+            for head in splits(gs[0], k):
+                out += [head + rest for rest in combos(gs[1:], parts - k)]
+        return out
+
+    found = set(combos(groups, 3))
+    return found.pop() if len(found) == 1 else None
 
 
 def snap_name(name, cfg):
