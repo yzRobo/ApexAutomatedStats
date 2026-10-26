@@ -53,7 +53,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.6"
+__version__ = "1.6.7"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -519,6 +519,36 @@ def ocr_gold_number(img_bgr, upscale=4):
     mask = cv2.inRange(hsv, np.array([15, 80, 90]), np.array([42, 255, 255]))
     iso = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
     return digitize(_rec(iso, upscale))
+
+
+# The character art sits to the right of each card's stat column and reaches into
+# the value boxes; a bright vertical edge of it OCRs as a phantom TRAILING digit
+# that the white-pixel mask below can't remove when the art itself is bright
+# (TCremer22 damage 768 -> 7687 and knocks 1 -> 11 on the same card, 2026-10-24).
+# The values are left-aligned with at most ~9px between glyphs at 1080p, while the
+# art starts >=44px past the text (measured on 7 real summaries), so cutting at the
+# first 20px empty run drops the art and never a real glyph.
+_ART_GAP = 20  # base-res px
+
+
+def trim_trailing_art(img_bgr, gap_px):
+    """Cut a left-aligned value crop at the first run of >= ``gap_px`` empty
+    columns after its text starts, so card art further right never reaches the
+    OCR. Returns the crop unchanged when there is no such gap (the old behaviour),
+    so the worst case is no change, never a clipped digit."""
+    if img_bgr is None or img_bgr.size == 0 or gap_px <= 0:
+        return img_bgr
+    ink = (img_bgr.max(axis=2) > 140).sum(axis=0) >= 2  # text or art in the column
+    xs = np.flatnonzero(ink)
+    if not xs.size:
+        return img_bgr
+    run = 0
+    for x in range(int(xs[0]), len(ink)):
+        run = 0 if ink[x] else run + 1
+        if run >= gap_px:
+            # Keep a few px of the gap so the last glyph's anti-aliased edge survives.
+            return img_bgr[:, :x - run + 1 + max(1, gap_px // 5)]
+    return img_bgr
 
 
 def ocr_white_number(img_bgr, upscale=3):
@@ -1032,6 +1062,7 @@ def extract_match(frame, cfg, scale):
     rows = cfg["rows"]
     value_w = cfg.get("value_width", 150)
     single_w = cfg.get("single_width", 75)
+    art_gap = scale({"x": 0, "y": 0, "w": _ART_GAP, "h": 0})[2]
     players = []
     for slot, col in enumerate(cfg["columns"], start=1):
         def field(row_key, width):
@@ -1039,8 +1070,10 @@ def extract_match(frame, cfg, scale):
             return crop(frame, scale(box))
 
         name = snap_name(ocr_field(field("name", col["w"])), cfg)
-        kills, assists, knocks = parse_kak(ocr_field(field("kak", value_w), numeric=True))
-        damage = parse_int(ocr_white_number(field("damage", value_w)))
+        kills, assists, knocks = parse_kak(ocr_field(
+            trim_trailing_art(field("kak", value_w), art_gap), numeric=True))
+        damage = parse_int(ocr_white_number(
+            trim_trailing_art(field("damage", value_w), art_gap)))
         revive = parse_int(ocr_field(field("revive", single_w), numeric=True, single=True))
         respawn = parse_int(ocr_field(field("respawn", single_w), numeric=True, single=True))
 
