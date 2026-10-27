@@ -414,8 +414,29 @@ def test_failed_insert_is_queued_and_retried():
         assert at.append_match(path, _match()) == (True, False)
         assert os.path.exists(at._unsynced_path(path))
         assert at.append_match(path, _match(session_id="2:1:2:def")) == (True, True)
-        assert [b[0]["session_id"] for b in db.inserted] == ["2:1:2:abc", "2:1:2:def"]
+        # the new match goes first, then the one that failed earlier
+        assert [b[0]["session_id"] for b in db.inserted] == ["2:1:2:def", "2:1:2:abc"]
         assert not os.path.exists(at._unsynced_path(path))
+    finally:
+        at._SUPABASE_CLIENT = client
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_supabase_still_down_costs_one_attempt_per_match():
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "apex_matches.csv")
+    db = _FlakyInsertDB(fail=99)
+    client, at._SUPABASE_CLIENT = at._SUPABASE_CLIENT, db
+    try:
+        for i in range(3):
+            at.append_match(path, _match(session_id=f"2:1:2:{i}"))
+        assert db.fail == 99 - 3  # one attempt each: no retry storm on the watch thread
+        with open(at._unsynced_path(path), encoding="utf-8") as f:
+            assert len(f.readlines()) == 3
+        db.fail = 0
+        at.append_match(path, _match(session_id="2:1:2:ok"))
+        assert [b[0]["session_id"] for b in db.inserted] == \
+            ["2:1:2:ok", "2:1:2:0", "2:1:2:1", "2:1:2:2"]
     finally:
         at._SUPABASE_CLIENT = client
         shutil.rmtree(tmp, ignore_errors=True)

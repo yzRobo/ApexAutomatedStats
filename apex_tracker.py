@@ -220,7 +220,14 @@ if load_dotenv and create_client:
     _SUPABASE_IS_SERVICE = bool(_service_key)
     if _url and _key and "your_" not in _url and "your_" not in _key:
         try:
-            _SUPABASE_CLIENT = create_client(_url, _key)
+            # 15 s instead of the 120 s default: inserts run on the watch thread, so
+            # a hung request (Supabase down) must not freeze reads of the next summary.
+            try:
+                from supabase import ClientOptions
+                _SUPABASE_CLIENT = create_client(
+                    _url, _key, options=ClientOptions(postgrest_client_timeout=15))
+            except ImportError:
+                _SUPABASE_CLIENT = create_client(_url, _key)
         except Exception as e:
             print(f"Warning: Failed to initialize Supabase client: {e}")
 
@@ -1402,7 +1409,13 @@ def _sync_unsynced(path):
     except (OSError, ValueError) as e:
         _note(f"(Supabase) couldn't read {os.path.basename(up)}: {e}")
         return False
-    left = [g for g in groups if not _supabase_insert(g)]
+    # Stop at the first failure: Supabase is evidently still unreachable, and each
+    # attempt can take the full request timeout on the watch thread.
+    left = []
+    for i, g in enumerate(groups):
+        if not _supabase_insert(g):
+            left = groups[i:]
+            break
     if len(left) < len(groups):
         _note(f"(Supabase) synced {len(groups) - len(left)} match(es) that failed earlier.")
     try:
@@ -1495,10 +1508,11 @@ def append_match(path, match):
     # Network sync runs outside the CSV lock so it can't block RP-patch threads.
     if not _SUPABASE_CLIENT:
         return csv_ok, None
-    earlier_ok = _sync_unsynced(path)
+    # This match first; the earlier failures are retried only once an insert works
+    # again, so a still-down Supabase costs one timeout here, not one per queued match.
     if _supabase_insert(supabase_rows):
         print(f"[{datetime.now():%H:%M:%S}] (Supabase) synced {len(supabase_rows)} player records.")
-        return csv_ok, earlier_ok
+        return csv_ok, _sync_unsynced(path)
     # Keep it for a retry with the next match instead of losing it from the dashboard.
     try:
         with open(_unsynced_path(path), "a", encoding="utf-8") as f:
