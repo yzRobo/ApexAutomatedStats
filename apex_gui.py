@@ -127,6 +127,10 @@ SETTINGS_GROUPS = [
         ("name_match_cutoff", "float", "Name match cutoff (0-1)",
          "How close an OCR'd name must be to a known gamertag to snap to it. "
          "Higher = stricter."),
+        ("owner_name", "str", "Your roster name (optional)",
+         "Who plays on this PC. The summary always shows you in the middle card, so a "
+         "middle name that misreads (e.g. 'FK') logs as you. Leave blank to work it "
+         "out from your recent matches."),
     ]),
     ("Ranked & RP", [
         ("ranked_detect_enabled", "bool", "Detect ranked vs pub matches",
@@ -652,7 +656,15 @@ class App:
 
         lm = s.get("last_match")
         if lm:
-            who = ", ".join(f"{p['name']} {p['kills']}k/{p['damage']}" for p in lm["players"])
+            def _who(p):
+                s = f"{p['name']}"
+                if p.get("legend"):
+                    s += f" ({p['legend']})"
+                s += f" {p['kills']}k/{p['damage']}"
+                if p.get("rp_change") is not None:
+                    s += f" {p['rp_change']:+d} RP"
+                return s
+            who = "\n".join(_who(p) for p in lm["players"])
             tag = {True: "RANKED", False: "PUB"}.get(lm.get("ranked"))
             tagtxt = f"  ·  {tag}" if tag else ""
             if lm.get("rp_note"):

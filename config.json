@@ -74,6 +74,10 @@
     "HeckaTrix"
   ],
   "name_match_cutoff": 0.8,
+  "_owner_name_help": "Optional: your own roster name on this PC. The summary screen always shows the local player in the middle card, so a middle name that misreads (e.g. 'FK') is logged as this name. Leave blank to work it out from your recent matches.",
+  "owner_name": "",
+  "_name_aliases_help": "Optional {new name: roster name} for a squadmate who changed their Apex name. Players with a UID are followed automatically (ALS reports the new name); this is for anyone without one. Club tags like [TAG] are ignored on their own.",
+  "name_aliases": {},
   "_als_uids_help": "Optional {name: uid} overrides for the ALS rank tracker. ALS can't always map an Apex display name to an account (notably Steam accounts), so list those players by UID here. PC/Steam = your SteamID64 (find it at apexlegendsstatus.com -> log in -> the number in your profile URL /profile/uid/PC/<uid>). Names not listed here are looked up by display name as usual.",
   "als_uids": {
     "yzRobo": "76561198029301970",

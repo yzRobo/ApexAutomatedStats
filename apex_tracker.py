@@ -30,6 +30,7 @@ import ctypes
 import ctypes.wintypes as wt
 from datetime import datetime, timezone
 import traceback
+from collections import Counter
 
 try:
     from dotenv import load_dotenv
@@ -53,7 +54,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.8"
+__version__ = "1.6.9"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -313,6 +314,24 @@ if load_dotenv:
     load_dotenv(os.path.join(HERE, ".env"))
 
 
+def _on_rank_poll(snapshot):
+    """After each ALS poll cycle: refresh the rename aliases snap_name follows, then
+    push the rank snapshot to Supabase."""
+    global _NAME_ALIASES
+    if _RANK_TRACKER is not None:
+        try:
+            aliases = _RANK_TRACKER.name_aliases()
+            if aliases != _NAME_ALIASES:
+                for new, roster in aliases.items():
+                    if _NAME_ALIASES.get(new) != roster:
+                        _note(f"(ALS) {roster} now plays as '{new}'; summaries with that "
+                              f"name log as {roster}.")
+                _NAME_ALIASES = aliases
+        except Exception as e:
+            _note(f"(ALS) name alias refresh skipped: {e}")
+    _sync_ranks_to_supabase(snapshot)
+
+
 def _resolve_als_key(cfg):
     """ALS key from config.json (Settings-editable) first, then the .env
     ALS_API_KEY (the owner's existing setup). None when unset/placeholder."""
@@ -360,7 +379,7 @@ def init_rank_tracker(cfg):
         # not the PyInstaller bundle). §4.1.
         _RANK_TRACKER = RankTracker(
             api_key=key, known_names=names, poll_seconds=poll, uids=uids,
-            on_poll=_sync_ranks_to_supabase,
+            on_poll=_on_rank_poll,
             ledger_path=os.path.join(HERE, "rp_ledger.jsonl"),
             retention_days=cfg.get("rp_ledger_retention_days", 14),
             reset_drop=cfg.get("rp_reset_drop", 800))
@@ -748,23 +767,60 @@ def _split_fused_kak(groups):
     return found.pop() if len(found) == 1 else None
 
 
+# A club tag in front of a name, e.g. '[CPAP] yzRobo'. OCR turns the brackets into
+# ( ) { } or |, so any of those count; the tag itself is 1-5 letters/digits.
+_CLAN_TAG = re.compile(r"^[\[\(\{|]\s*[0-9A-Za-z]{1,5}\s*[\]\)\}|]\s*")
+
+# {current Apex name: roster name} learned from ALS (a renamed player's UID still
+# resolves, and ALS reports the new name). Replaced whole by _on_rank_poll, never
+# mutated, so readers need no lock.
+_NAME_ALIASES = {}
+
+
 def snap_name(name, cfg):
     """Snap an OCR'd name to the closest recurring squadmate name, if close enough.
     Fixes stray-glyph misreads, and handles the game truncating long names behind
     the card art (so we also compare against each known name's matching-length
-    prefix, e.g. OCR 'WhopperGot' vs 'WhopperGobbler'[:10] = 'WhopperGob')."""
+    prefix, e.g. OCR 'WhopperGot' vs 'WhopperGobbler'[:10] = 'WhopperGob').
+
+    An exact match ignoring case counts ('YZROBO'), a leading club tag is tried both
+    ways ('[TTV] SaWaii'),
+    and a player's newer Apex name maps to their roster name - from config
+    ``name_aliases`` ({"NewName": "RosterName"}) or learned from ALS. Only ever
+    returns a roster name or the read unchanged, never the read with its tag cut off."""
     import difflib
     name = (name or "").strip()
     known = cfg.get("known_names") or []
     if not name or not known:
         return name
     cutoff = cfg.get("name_match_cutoff", 0.8)
+    # Candidates: each roster name itself, plus any alias that points at one.
+    targets = [(k, k) for k in known]
+    manual = cfg.get("name_aliases")
+    for alias, roster in {**(manual if isinstance(manual, dict) else {}),
+                          **_NAME_ALIASES}.items():
+        if isinstance(alias, str) and alias and roster in known:
+            targets.append((alias, roster))
+    reads = [name]
+    untagged = _CLAN_TAG.sub("", name, count=1).strip()
+    if untagged and untagged != name:
+        reads.append(untagged)
     best, best_r = name, 0.0
-    for k in known:
-        r = max(difflib.SequenceMatcher(None, name, k).ratio(),
-                difflib.SequenceMatcher(None, name, k[:len(name)]).ratio())
-        if r > best_r:
-            best, best_r = k, r
+    for read in reads:
+        for cand, roster in targets:
+            # Case counts toward closeness as before (scoring case-blind let randoms
+            # like 'NameJack' reach a roster name); only an exact match ignoring case
+            # ('YZROBO') is new.
+            if read.lower() == cand.lower():
+                r = 1.0
+            else:
+                r = difflib.SequenceMatcher(None, read, cand).ratio()
+                # The truncation prefix only for reads long enough to have been cut
+                # off: a 1-2 glyph read ('s') would otherwise match every name so.
+                if len(read) >= 5:
+                    r = max(r, difflib.SequenceMatcher(None, read, cand[:len(read)]).ratio())
+            if r > best_r:
+                best, best_r = roster, r
     return best if best_r >= cutoff else name
 
 
@@ -1261,7 +1317,15 @@ CSV_FIELDS = [
     # Match-level: True/False once ranked detection (default-off) has run, else
     # blank. Appended last so it never shifts the columns of pre-existing CSVs.
     "ranked",
+    # The legend each roster player used, per ALS presence (blank when unknown).
+    "legend",
 ]
+
+# Optional apex_matches columns, newest first: a project that hasn't run the
+# matching migration rejects a whole insert naming one (PGRST204), so they are
+# dropped one by one until the insert goes through.
+_OPTIONAL_DB_COLUMNS = (("legend", "supabase_migration_legend.sql"),
+                        ("ranked", "supabase_migration_ranked.sql"))
 
 # Serializes all writes to the CSV. append_match() runs on the watch loop while
 # the async RP-resolution threads rewrite the file to patch ending_rp; without
@@ -1372,28 +1436,31 @@ def _unsynced_path(path):
 
 def _supabase_insert(rows):
     """Insert one match's rows. Returns True on success. If the project hasn't run
-    supabase_migration_ranked.sql, the `ranked` column is missing and PostgREST
-    rejects the WHOLE insert (PGRST204); then `ranked` is stripped and the insert
-    retried so the core stats still sync (the flag stays CSV-only until the column
-    exists)."""
+    a column's migration (supabase_migration_ranked.sql, ..._legend.sql), PostgREST
+    rejects the WHOLE insert (PGRST204); then that column is stripped and the insert
+    retried so the core stats still sync (the value stays CSV-only until the column
+    exists). Also the path for retries from the _unsynced.jsonl queue."""
     def _insert(rs):
         # returning="minimal" avoids reading the rows back, so this works under an
         # insert-only RLS policy (no SELECT granted to anon).
         _SUPABASE_CLIENT.table("apex_matches").insert(rs, returning="minimal").execute()
-    try:
-        _insert(rows)
-        return True
-    except Exception as e:
-        if "ranked" in str(e) and any("ranked" in r for r in rows):
-            try:
-                _insert([{k: v for k, v in r.items() if k != "ranked"} for r in rows])
-                _note(f"(Supabase) synced {len(rows)} records WITHOUT 'ranked' - run "
-                      f"supabase_migration_ranked.sql to store the ranked flag.")
-                return True
-            except Exception as e2:
-                e = e2
-        _note(f"(Supabase) Error syncing to Supabase: {e}")
-        return False
+    dropped = []
+    while True:
+        try:
+            _insert(rows)
+            break
+        except Exception as e:
+            col = next(((c, sql) for c, sql in _OPTIONAL_DB_COLUMNS
+                        if c in str(e) and any(c in r for r in rows)), None)
+            if col is None:
+                _note(f"(Supabase) Error syncing to Supabase: {e}")
+                return False
+            dropped.append(col)
+            rows = [{k: v for k, v in r.items() if k != col[0]} for r in rows]
+    for c, sql in dropped:
+        _note(f"(Supabase) synced {len(rows)} records WITHOUT '{c}' - run {sql} "
+              f"to store it.")
+    return True
 
 
 def _sync_unsynced(path):
@@ -1734,6 +1801,112 @@ def cmd_calibrate(arg, forced_res=None):
               f"dmg={p['damage']} rev={p['revive_given']} resp={p['respawn_given']}")
 
 
+# Matches looked at to work out which roster player is this PC's own (see
+# resolve_owner); the name must hold the middle card in at least 8 of them and 70%.
+_OWNER_SAMPLE = 30
+
+
+def resolve_owner(cfg, path):
+    """This PC's own roster player, or None. The summary screen always shows the
+    local player in the middle card, so that is the name to fall back on when the
+    middle name misreads (an 'FK' for yzRobo). From config ``owner_name`` when set,
+    else the roster name holding slot 2 in the CSV's recent matches."""
+    known = cfg.get("known_names") or []
+    set_name = (cfg.get("owner_name") or "").strip()
+    if set_name:
+        snapped = snap_name(set_name, cfg)
+        return snapped if snapped in known else None
+    try:
+        rows = _read_csv_rows(path)
+    except (OSError, ValueError, csv.Error):
+        return None
+    matches = {}
+    for r in rows:  # insertion order = log order
+        matches.setdefault((r.get("session_id"), r.get("timestamp")), []).append(r)
+    mids = [next((r.get("name") for r in rs if str(r.get("player_slot")) == "2"), None)
+            for rs in list(matches.values())[-_OWNER_SAMPLE:]]
+    counts = Counter(m for m in mids if m in known)
+    if not counts:
+        return None
+    top, n = counts.most_common(1)[0]
+    return top if n >= 8 and n >= 0.7 * len(mids) else None
+
+
+def _last_logged_epoch(path):
+    """Epoch of the newest match in the CSV, or None."""
+    try:
+        rows = _read_csv_rows(path)
+    except (OSError, ValueError, csv.Error):
+        return None
+    for r in reversed(rows):
+        try:
+            return datetime.fromisoformat(r.get("timestamp") or "").timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _apply_owner_fallback(match, cfg, owner):
+    """Put *owner* in the middle card when its name read as nothing on the roster
+    (blank, or garbage like 'FK'). Skipped when the owner already shows in another
+    slot, or ALS has this PC's owner in no match lately - then someone else is
+    playing on this PC (another account) and the read stands. Returns the replaced
+    read, or None when nothing changed."""
+    players = match.get("players") or []
+    known = cfg.get("known_names") or []
+    if not owner or owner not in known or len(players) != 3:
+        return None
+    mid = players[1]
+    if mid["name"] in known or any(p["name"] == owner for p in players):
+        return None
+    if _RANK_TRACKER is not None:
+        try:
+            if _RANK_TRACKER.in_match_recently(owner) is False:
+                return None
+        except Exception:
+            pass
+    raw = mid["name"]
+    mid["name"] = owner
+    return raw
+
+
+# {session_id: {"ranked": bool|None, "rp": {name: rp_change}}} from the RP resolver,
+# so the app's "Last" line can show what it found after the match logged (it used to
+# keep the lobby-badge guess, e.g. PUB on a ranked game the badge check missed).
+_RESOLVED_MATCHES = {}
+_RESOLVED_LOCK = threading.Lock()
+
+
+def _note_resolved(session_id, name, cols):
+    with _RESOLVED_LOCK:
+        m = _RESOLVED_MATCHES.setdefault(session_id, {"ranked": None, "rp": {}})
+        if cols.get("ranked") is not None:
+            m["ranked"] = cols["ranked"]
+        if cols.get("rp_change") is not None:
+            m["rp"][name] = cols["rp_change"]
+        while len(_RESOLVED_MATCHES) > 20:
+            _RESOLVED_MATCHES.pop(next(iter(_RESOLVED_MATCHES)))
+
+
+def _refresh_last_match(status):
+    """Copy the resolver's verdict for the last logged match into status."""
+    lm = status.get("last_match")
+    if not lm:
+        return
+    with _RESOLVED_LOCK:
+        m = _RESOLVED_MATCHES.get(lm.get("session_id"))
+        if not m:
+            return
+        ranked, rp = m["ranked"], dict(m["rp"])
+    if ranked is not None:
+        lm["ranked"] = ranked
+    if rp:
+        lm["rp_note"] = None
+    for p in lm.get("players") or []:
+        if p.get("name") in rp:
+            p["rp_change"] = rp[p["name"]]
+
+
 def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
                    ranked=None, stable=None, frame_ts=None):
     """Read a settled summary frame and log it if it's new and fully rendered.
@@ -1756,6 +1929,9 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     baseline + pending record, and the resolver classifies it from the ledger
     later (an observed delta proves ranked even if the badge was missed)."""
     match = extract_match(frame, cfg_eff, scale)
+    # Before the completeness check and the fingerprint, so a blank middle name can
+    # still log and both confirming reads carry the same name.
+    owner_from = _apply_owner_fallback(match, cfg_eff, status.get("owner"))
     # Wait until every player is named, every stat field read, AND placement has
     # rendered, so we never log a half-drawn screen. Names + placement alone is
     # not enough: a card whose K/A/Kn or damage row failed OCR returns None for
@@ -1840,6 +2016,25 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
             p["ending_rp"] = None
             p["rp_change"] = None
 
+    # Legend per roster player from ALS presence. Every row gets the key or none
+    # does: a bulk insert needs identical keys, and without any legend the insert
+    # stays as it was (no column the project may not have migrated yet).
+    known = cfg_eff.get("known_names") or []
+    legends = {}
+    if _RANK_TRACKER is not None:
+        try:
+            legends = _RANK_TRACKER.match_legends(
+                [p["name"] for p in match["players"] if p["name"] in known],
+                anchor=status.get("owner"), after=status.get("last_logged_epoch"))
+        except Exception as e:
+            _note(f"(ALS) legend lookup failed: {e}")
+    if legends:
+        for p in match["players"]:
+            p["legend"] = legends.get(p["name"])
+    if owner_from is not None:
+        _note(f"slot 2 read as {owner_from!r}; logged as this PC's player "
+              f"{status.get('owner')} (the middle card is always the local player).")
+
     csv_ok, db_ok = append_match(path, match)
     status["csv_problem"] = (None if csv_ok else
                              "CSV locked or unwritable (open in Excel?) - matches are kept in "
@@ -1851,9 +2046,10 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     if sk:
         seen.add(sk)
     status["logged_this_run"] += 1
+    status["last_logged_epoch"] = time.time()
     # Every roster player in the match without an RP baseline means this match will
     # get no RP at all - say so next to it rather than leave a silent blank.
-    rostered = [p for p in match["players"] if p["name"] in (cfg_eff.get("known_names") or [])]
+    rostered = [p for p in match["players"] if p["name"] in known]
     rp_note = None
     if rostered and all(p.get("starting_rp") is None for p in rostered):
         state, detail = _rp_state()
@@ -1866,8 +2062,9 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
         "ranked": ranked,  # True / False / None(detection off) - shown by front-ends
         "time": datetime.now().strftime("%H:%M:%S"),
         "rp_note": rp_note,
-        "players": [{"name": p["name"], "kills": p["kills"],
-                     "damage": p["damage"]} for p in match["players"]],
+        "players": [{"name": p["name"], "kills": p["kills"], "damage": p["damage"],
+                     "legend": p.get("legend"), "rp_change": None}
+                    for p in match["players"]],
     }
     emit("log")
     if log_cb:
@@ -2149,6 +2346,7 @@ def _enqueue_rp_pending(match, csv_path_str):
         "damage": p.get("damage"),
         "kills": p.get("kills"),
         "match_fp": match_fp,
+        "legend": p.get("legend"),
     } for p in match["players"] if p.get("starting_rp") is not None]
     if not new_records:
         return
@@ -2265,6 +2463,7 @@ def _rp_resolve_sweep():
         _safe_patch_rp(patch.get("csv_path"), patch["session_id"],
                        {patch["name"]: cols},
                        hints={patch["name"]: by_key.get((patch["session_id"], patch["name"]))})
+        _note_resolved(patch["session_id"], patch["name"], cols)
         _note(f"(ALS) RP resolved for {patch['session_id']} / {patch['name']}: {cols}.")
     for note in actions.notes:
         _note(f"(ALS) {note}")
@@ -2489,6 +2688,14 @@ def _patch_rp_surviving_copy(session_id, name, cols, hint):
         .eq("id", row["id"]).is_("rp_change", "null").execute()
     _note(f"(Supabase) RP for {name} written to the surviving copy {row['session_id']} "
           f"(this PC's copy {session_id} was removed as a cross-PC duplicate).")
+    # The legend went down with this PC's copy too. Separate, best-effort update: it
+    # fails harmlessly until supabase_migration_legend.sql has added the column.
+    if hint.get("legend"):
+        try:
+            _SUPABASE_CLIENT.table("apex_matches").update({"legend": hint["legend"]}) \
+                .eq("id", row["id"]).is_("legend", "null").execute()
+        except Exception as e:
+            _note(f"(Supabase) legend for {name} not copied to the surviving row: {e}")
 
 
 def _rank_status_lines():
@@ -2570,6 +2777,8 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     path = csv_path(cfg)
     _DIAG = _make_debug_logger(cfg, header=False)  # so the dedup read below can report
     seen = already_logged_ids(path)
+    owner = resolve_owner(cfg, path)
+    last_logged = _last_logged_epoch(path)
     poll = cfg.get("poll_seconds", 1.0)
     # A frame is only "stale" once it's older than the capture interval plus a
     # margin; otherwise a high throttle_ms (the stutter fix) trips false warnings.
@@ -2591,10 +2800,15 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
               # last exception a loop pass survived ({msg, count, active, time}), and
               # a CSV / Supabase write that is failing.
               "rp_state": _rp_state(), "read_reason": None, "unread_summary": None,
-              "missed": None, "loop_error": None, "csv_problem": None, "db_problem": None}
+              "missed": None, "loop_error": None, "csv_problem": None, "db_problem": None,
+              # This PC's own roster player, the fallback for a misread middle card,
+              # and when the last match was logged (legend readings from a match that
+              # began before it belong to an earlier game).
+              "owner": owner, "last_logged_epoch": last_logged}
 
     def emit(event):
         status["event"] = event
+        _refresh_last_match(status)
         if status_cb:
             try:
                 status_cb(dict(status))
@@ -2631,6 +2845,7 @@ def run_watch(cfg, forced_res=None, stop_event=None, status_cb=None, log_cb=None
     dbg(f"continuous watch started; mode={cap_mode} poll={poll}s csv={path}")
     dbg("RP tracking: %s%s" % (status["rp_state"][0],
                                f" ({status['rp_state'][1]})" if status["rp_state"][1] else ""))
+    dbg(f"this PC's player (middle card): {status.get('owner') or 'unknown - no fallback'}")
     episode = _SummaryEpisode(status, emit, dbg)
     errors = 0
     cap, src, hwnd = open_live_capture(cfg)
@@ -2859,6 +3074,7 @@ def _watch_on_demand(cfg, forced, path, seen, poll, settle_seconds, hb_secs,
         f"poll={poll}s csv={path}")
     dbg("RP tracking: %s%s" % (status["rp_state"][0],
                                f" ({status['rp_state'][1]})" if status["rp_state"][1] else ""))
+    dbg(f"this PC's player (middle card): {status.get('owner') or 'unknown - no fallback'}")
     episode = _SummaryEpisode(status, emit, dbg)
     errors = 0
     announced = False

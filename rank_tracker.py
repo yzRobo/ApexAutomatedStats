@@ -28,6 +28,15 @@ _ALS_BRIDGE = "https://api.apexlegendsstatus.com/bridge"
 _LEDGER_RING = 2000
 # Rotate the ledger file once it grows past this on startup (keeps one backup).
 _LEDGER_MAX_BYTES = 10 * 1024 * 1024
+# Per-player presence ring (state / legend readings). Small: only the last match
+# or two matter for legend attribution.
+_PRESENCE_RING = 400
+# A legend reading counts for a match only if it was taken in the last 45 min and
+# its in-match state began no earlier than that (a BR match is ~25 min at most).
+_MATCH_WINDOW = 45 * 60
+# Squadmates enter a match within seconds of each other; readings whose state-since
+# times are further apart than this belong to different matches.
+_SINCE_TOLERANCE = 120
 
 # Serializes ALL ledger FILE I/O across RankTracker instances. A reconfigure
 # (Stop->Start with changed roster/key) builds a new tracker on the SAME ledger
@@ -115,6 +124,12 @@ class RankTracker:
         self._ledger_lock = threading.Lock()
         # {name: deque[{"ts", "rp", "reset"}]} — readers hold _ledger_lock.
         self._obs = {}
+        # Presence for legend attribution: {name: deque[{"ts", "state", "since",
+        # "legend"}]} from every successful response, including ones with no usable
+        # RP (unranked players, degraded rankScore). Seeded from the ledger so a
+        # restart mid-match keeps its readings. Readers hold _lock (created below,
+        # before the poll thread starts; hydration runs single-threaded).
+        self._presence = {}
         # Per-name last-seen season / rp / tier for reset detection across reads
         # (and across restarts, seeded from the hydrated ledger).
         self._last_season = {}
@@ -137,6 +152,10 @@ class RankTracker:
         self._notfound_counts = {}
         self._warned = set()
         self._learned_uids = {}
+        # {roster name: current Apex name per ALS}. Polling by UID keeps working
+        # after a rename, so this is how a renamed player's new summary name is
+        # mapped back to the roster (see name_aliases()).
+        self._als_names = {}
         # Health for status displays (see health()): when the last usable reading
         # arrived and the last failure seen. Every failure used to go only to
         # print(), which the GUI build discards, so a rejected key or an ALS outage
@@ -210,6 +229,86 @@ class RankTracker:
         session (so the caller can offer to persist them to config)."""
         with self._lock:
             return dict(self._learned_uids)
+
+    def name_aliases(self):
+        """``{current Apex name: roster name}`` for players whose name on ALS no
+        longer matches their roster entry (a rename; polls by UID keep working)."""
+        with self._lock:
+            return {als: roster for roster, als in self._als_names.items()
+                    if als and als.lower() != roster.lower()}
+
+    # ------------------------------------------------------------------ #
+    # Presence — which legend each player used in a match
+    # ------------------------------------------------------------------ #
+    def _last_in_match(self, name, at):
+        """Latest ``inMatch`` reading for *name* in the window ending at *at*, or
+        None. Caller holds ``_lock``."""
+        for o in reversed(self._presence.get(name) or ()):
+            if o["ts"] > at:
+                continue
+            if o["ts"] < at - _MATCH_WINDOW:
+                return None
+            if o["state"] != "inMatch":
+                continue
+            if o["since"] is not None and o["since"] < at - _MATCH_WINDOW:
+                return None  # a stuck/stale state, not a match that just ended
+            return o
+        return None
+
+    def match_legends(self, names, at=None, anchor=None, after=None):
+        """``{name: legend}`` for the match that just ended at *at* (default now).
+
+        Each player's legend is the one ALS reported in their latest ``inMatch``
+        reading (the last reading is past legend select). Readings from another
+        match are left out:
+          - *after*: when the previous match was logged. This match started after
+            it, so a reading whose match began well before it (a short game that no
+            poll landed in) belongs to the game before.
+          - the match's state-since time. Squadmates enter a match within seconds of
+            each other. *anchor* (this PC's own player, who is on the summary so is
+            in this match) sets it when they have a reading; otherwise the time most
+            players share does, and a tie sets nothing - with two players, one may
+            be a teammate who quit and already queued into another game.
+        Players with no usable reading (not on the roster, EA privacy hiding
+        presence, the tracker started late) are absent from the result."""
+        at = time.time() if at is None else float(at)
+        with self._lock:
+            latest = {}
+            for n in dict.fromkeys(names):
+                o = self._last_in_match(n, at)
+                if o is None or not o["legend"]:
+                    continue
+                if after is not None and (o["ts"] < after if o["since"] is None
+                                          else o["since"] < after - 60):
+                    continue
+                latest[n] = o
+        sinces = [o["since"] for o in latest.values() if o["since"] is not None]
+        if not sinces:
+            return {n: o["legend"] for n, o in latest.items()}
+        if anchor in latest and latest[anchor]["since"] is not None:
+            ref = latest[anchor]["since"]
+        else:
+            votes = {s: sum(abs(t - s) <= _SINCE_TOLERANCE for t in sinces) for s in sinces}
+            top = max(votes.values())
+            clusters = {min(t for t in sinces if abs(t - s) <= _SINCE_TOLERANCE)
+                        for s, v in votes.items() if v == top}
+            if len(clusters) > 1:
+                return {n: o["legend"] for n, o in latest.items() if o["since"] is None}
+            ref = next(s for s, v in votes.items() if v == top)
+        return {n: o["legend"] for n, o in latest.items()
+                if o["since"] is None or abs(o["since"] - ref) <= _SINCE_TOLERANCE}
+
+    def in_match_recently(self, name, at=None):
+        """Whether ALS saw *name* in a match within the last 45 min: True/False, or
+        None when there is no presence data for them in that window (no ALS key,
+        privacy settings, the tracker just started)."""
+        at = time.time() if at is None else float(at)
+        with self._lock:
+            ring = self._presence.get(name) or ()
+            recent = [o for o in ring if at - _MATCH_WINDOW <= o["ts"] <= at]
+            if not recent or all(o["state"] is None for o in recent):
+                return None
+            return self._last_in_match(name, at) is not None
 
     # ------------------------------------------------------------------ #
     # RP ledger (§4.1) — session delta + resolver evidence
@@ -369,6 +468,8 @@ class RankTracker:
             learned_uid = _extract_uid(data)
             season = _extract_season(data)
             state, in_game = _extract_realtime(data)
+            legend, since = _extract_presence(data)
+            als_name = _extract_name(data)
             # EA/ALS occasionally serves a degraded response with rankScore=0 (or
             # a missing rank block → None) for a player who very much has RP.
             # Trusting it poisons everything downstream: a 0 baseline, bogus
@@ -383,6 +484,14 @@ class RankTracker:
             with self._lock:
                 entry = self._cache.get(name)
                 self._last_contact_ts = time.time()
+                # Presence is recorded on every answer, usable RP or not.
+                ring = self._presence.get(name)
+                if ring is None:
+                    ring = self._presence[name] = deque(maxlen=_PRESENCE_RING)
+                ring.append({"ts": self._last_contact_ts, "state": state,
+                             "since": since, "legend": legend})
+                if als_name:
+                    self._als_names[name] = als_name
                 if rp is not None:
                     self._last_ok_ts = time.time()
                     self._last_error = None
@@ -422,7 +531,8 @@ class RankTracker:
             # rankScore are useful for deltas, so skip a None rp.
             if rp is not None:
                 self._append_observation(name, self._uids.get(name), rp,
-                                         rank_name, rank_div, season, state, in_game)
+                                         rank_name, rank_div, season, state, in_game,
+                                         legend=legend, since=since)
             if newly_learned:
                 _log(f"[RankTracker] {name}: learned UID {newly_learned} "
                      f"-> future polls use it (no more name search)")
@@ -454,7 +564,8 @@ class RankTracker:
     # ------------------------------------------------------------------ #
     # Ledger internals
     # ------------------------------------------------------------------ #
-    def _append_observation(self, name, uid, rp, tier, div, season, state, in_game):
+    def _append_observation(self, name, uid, rp, tier, div, season, state, in_game,
+                            legend=None, since=None):
         """Record one reading in the on-disk ledger and the in-memory ring.
 
         Flags a discontinuity (``"reset": true``) when the ranked season changes,
@@ -490,6 +601,7 @@ class RankTracker:
                     "ts": entry["ts"], "name": name, "uid": uid, "rp": rp,
                     "tier": tier or None, "div": div if div else None,
                     "season": season, "state": state, "in_game": in_game,
+                    "legend": legend, "since": since,
                     **({"reset": True} if reset else {}),
                 })
         # File append is under the SHARED lock (serializes vs a sibling instance's
@@ -557,6 +669,12 @@ class RankTracker:
                         ring = self._obs[name] = deque(maxlen=_LEDGER_RING)
                     ring.append({"ts": ts, "rp": rp, "reset": bool(d.get("reset")),
                                  "in_game": d.get("in_game")})
+                    if "legend" in d:  # lines from v1.6.9 on carry presence
+                        pres = self._presence.get(name)
+                        if pres is None:
+                            pres = self._presence[name] = deque(maxlen=_PRESENCE_RING)
+                        pres.append({"ts": ts, "state": d.get("state"),
+                                     "since": d.get("since"), "legend": d.get("legend")})
                     # Seed reset-detection state so it continues across the restart.
                     self._last_rp[name] = rp
                     if d.get("season") is not None:
@@ -636,6 +754,32 @@ def _extract_realtime(data):
         in_game = bool(in_game)
     return (str(state) if state not in (None, "") else None,
             in_game if isinstance(in_game, bool) else None)
+
+
+def _extract_presence(data):
+    """``realtime.selectedLegend`` and ``realtime.currentStateSinceTimestamp`` →
+    ``(legend, since_epoch)``, each None when absent. In a match, selectedLegend
+    is the legend being played (checked live against the squad on 2026-11-07)."""
+    try:
+        rt = data.get("realtime") or {}
+    except AttributeError:
+        return None, None
+    legend = rt.get("selectedLegend")
+    legend = str(legend).strip() if legend not in (None, "") else None
+    try:
+        since = float(rt.get("currentStateSinceTimestamp"))
+    except (TypeError, ValueError):
+        since = None
+    return legend or None, (since if since and since > 0 else None)
+
+
+def _extract_name(data):
+    """``global.name`` → the player's current Apex name, or ''."""
+    try:
+        name = data["global"]["name"]
+    except (KeyError, TypeError):
+        return ""
+    return str(name).strip() if name not in (None, "") else ""
 
 
 def _log(msg):
