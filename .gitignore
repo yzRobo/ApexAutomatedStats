@@ -185,6 +185,7 @@ cython_debug/
 apex_matches.csv
 apex_matches_*.csv
 rp_pending.json
+map_rotation.json
 *.tmp
 debug/
 # Built distributable is published via GitHub Releases, not committed

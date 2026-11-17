@@ -667,6 +667,8 @@ class App:
             who = "\n".join(_who(p) for p in lm["players"])
             tag = {True: "RANKED", False: "PUB"}.get(lm.get("ranked"))
             tagtxt = f"  ·  {tag}" if tag else ""
+            if lm.get("map"):
+                tagtxt += f"  ·  {lm['map']}"
             if lm.get("rp_note"):
                 tagtxt += f"  ·  {lm['rp_note']}"
             self.last_lbl.config(

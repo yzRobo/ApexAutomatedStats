@@ -54,7 +54,7 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
 
-__version__ = "1.6.9"
+__version__ = "1.7.0"
 REPO = "yzRobo/ApexAutomatedStats"  # for the in-app update check
 
 
@@ -382,7 +382,8 @@ def init_rank_tracker(cfg):
             on_poll=_on_rank_poll,
             ledger_path=os.path.join(HERE, "rp_ledger.jsonl"),
             retention_days=cfg.get("rp_ledger_retention_days", 14),
-            reset_drop=cfg.get("rp_reset_drop", 800))
+            reset_drop=cfg.get("rp_reset_drop", 800),
+            rotation_path=os.path.join(HERE, "map_rotation.json"))
         _RANK_TRACKER_SIG = sig
         print(f"(ALS) Rank tracker started for {len(names)} players "
               f"(poll every {poll}s).")
@@ -1319,12 +1320,19 @@ CSV_FIELDS = [
     "ranked",
     # The legend each roster player used, per ALS presence (blank when unknown).
     "legend",
+    # The pubs and ranked maps in rotation when the match began (ALS map rotation;
+    # blank when unknown). Front-ends show the one matching the ranked flag.
+    "pubs_map", "ranked_map",
 ]
 
 # Optional apex_matches columns, newest first: a project that hasn't run the
 # matching migration rejects a whole insert naming one (PGRST204), so they are
 # dropped one by one until the insert goes through.
-_OPTIONAL_DB_COLUMNS = (("legend", "supabase_migration_legend.sql"),
+# Matched as substrings of the error, so a name that contains another
+# ("ranked_map" contains "ranked") must come before it.
+_OPTIONAL_DB_COLUMNS = (("pubs_map", "supabase_migration_map.sql"),
+                        ("ranked_map", "supabase_migration_map.sql"),
+                        ("legend", "supabase_migration_legend.sql"),
                         ("ranked", "supabase_migration_ranked.sql"))
 
 # Serializes all writes to the CSV. append_match() runs on the watch loop while
@@ -1900,6 +1908,8 @@ def _refresh_last_match(status):
         ranked, rp = m["ranked"], dict(m["rp"])
     if ranked is not None:
         lm["ranked"] = ranked
+        maps = lm.get("maps") or {}
+        lm["map"] = _shown_map(ranked, maps.get("pubs"), maps.get("ranked"))
     if rp:
         lm["rp_note"] = None
     for p in lm.get("players") or []:
@@ -2031,6 +2041,22 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
     if legends:
         for p in match["players"]:
             p["legend"] = legends.get(p["name"])
+    # The pubs and ranked maps in rotation when the match began. Both are stored
+    # because the ranked flag can still change (the RP resolver may prove a "pub"
+    # was ranked); the dashboard picks one with the final flag. Same key rule as
+    # legend: every row or none.
+    maps = {}
+    if _RANK_TRACKER is not None:
+        try:
+            maps = _RANK_TRACKER.match_maps(
+                [p["name"] for p in match["players"] if p["name"] in known],
+                anchor=status.get("owner"), after=status.get("last_logged_epoch"))
+        except Exception as e:
+            _note(f"(ALS) map lookup failed: {e}")
+    if any(maps.values()):
+        for p in match["players"]:
+            p["pubs_map"] = maps.get("battle_royale")
+            p["ranked_map"] = maps.get("ranked")
     if owner_from is not None:
         _note(f"slot 2 read as {owner_from!r}; logged as this PC's player "
               f"{status.get('owner')} (the middle card is always the local player).")
@@ -2060,6 +2086,8 @@ def _try_log_match(frame, cfg_eff, scale, path, seen, status, emit, log_cb,
         "placed": match["squad_placed"],
         "total_kills": match["total_squad_kills"],
         "ranked": ranked,  # True / False / None(detection off) - shown by front-ends
+        "map": _shown_map(ranked, maps.get("battle_royale"), maps.get("ranked")),
+        "maps": {"pubs": maps.get("battle_royale"), "ranked": maps.get("ranked")},
         "time": datetime.now().strftime("%H:%M:%S"),
         "rp_note": rp_note,
         "players": [{"name": p["name"], "kills": p["kills"], "damage": p["damage"],
@@ -2347,6 +2375,8 @@ def _enqueue_rp_pending(match, csv_path_str):
         "kills": p.get("kills"),
         "match_fp": match_fp,
         "legend": p.get("legend"),
+        "pubs_map": p.get("pubs_map"),
+        "ranked_map": p.get("ranked_map"),
     } for p in match["players"] if p.get("starting_rp") is not None]
     if not new_records:
         return
@@ -2675,6 +2705,7 @@ def _patch_rp_surviving_copy(session_id, name, cols, hint):
               f"{len(same)} other copies of the match; left blank.")
         return
     mates = same[0]
+    _copy_maps_to_survivor(mates[0]["session_id"], hint)
     row = next((r for r in mates if r.get("name") == name), None)
     if row is None:  # the other PC OCR'd the name differently ('ullvautnunter')
         pair = [r for r in mates
@@ -2696,6 +2727,30 @@ def _patch_rp_surviving_copy(session_id, name, cols, hint):
                 .eq("id", row["id"]).is_("legend", "null").execute()
         except Exception as e:
             _note(f"(Supabase) legend for {name} not copied to the surviving row: {e}")
+
+
+def _copy_maps_to_survivor(survivor_sid, hint):
+    """Give the surviving copy of a match this PC's maps when it has none (the other
+    PC had no ALS key, or an older build). Map is per match, so every row of that
+    session is filled; rows that already have a map are left alone. Best-effort: it
+    fails harmlessly until supabase_migration_map.sql has added the columns."""
+    cols = {c: hint.get(c) for c in ("pubs_map", "ranked_map") if hint.get(c)}
+    if not cols:
+        return
+    try:
+        _SUPABASE_CLIENT.table("apex_matches").update(cols)             .eq("session_id", survivor_sid).is_("pubs_map", "null")             .is_("ranked_map", "null").execute()
+    except Exception as e:
+        _note(f"(Supabase) map not copied to the surviving copy {survivor_sid}: {e}")
+
+
+def _shown_map(ranked, pubs_map, ranked_map):
+    """The map to show for a match: the ranked map for ranked, the pubs map for a
+    pub, and with no ranked flag only a map both playlists had."""
+    if ranked is True:
+        return ranked_map
+    if ranked is False:
+        return pubs_map
+    return pubs_map if pubs_map == ranked_map else None
 
 
 def _rank_status_lines():
@@ -3289,6 +3344,8 @@ def cmd_watch(forced_res=None):
         names = ", ".join(f"{p['name']}({p['kills']}k/{p['damage']}dmg)" for p in m["players"])
         # Show how the match was tagged: RANKED / PUB, or nothing if detection is off.
         tag = {True: " [RANKED]", False: " [PUB]"}.get(m.get("ranked"), "")
+        if m.get("map"):
+            tag += f" {m['map']}"
         print(f"[{datetime.now():%H:%M:%S}] logged {m['session_id']}{tag}  "
               f"#{m['placed']} {m['total_kills']}k -> {names}")
 

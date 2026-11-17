@@ -21,6 +21,22 @@ from datetime import datetime
 
 
 _ALS_BRIDGE = "https://api.apexlegendsstatus.com/bridge"
+# Map rotation: the current and next map, with start/end times, for each playlist.
+_ALS_ROTATION = "https://api.apexlegendsstatus.com/maprotation?version=2"
+# The playlists whose map is stored per match: pubs (ALS "battle_royale") and ranked.
+# The match row stores both; the dashboard picks one with the match's ranked flag.
+ROTATION_MODES = ("battle_royale", "ranked")
+# Refetch the rotation when the stored windows stop covering the next 10 minutes, and
+# anyway every 30 min so a schedule ALS changes mid-window is picked up.
+_ROTATION_AHEAD = 10 * 60
+_ROTATION_REFRESH = 30 * 60
+# The least time between two fetches, whether the last one worked or not.
+_ROTATION_RETRY = 5 * 60
+# Windows that ended longer ago than this are dropped from memory and disk.
+_ROTATION_KEEP = 2 * 86400
+# Without a match start time, the map is still known when the same map was up for
+# this whole span before the summary was read (a BR match is ~25 min at most).
+_MATCH_MAX_SECS = 30 * 60
 
 # Per-player in-memory ledger ring buffer size. At the 30s default cadence this
 # holds ~16h of readings, plenty for a session delta and the resolver's windows;
@@ -98,11 +114,15 @@ class RankTracker:
         An RP drop larger than this in one step, alongside a tier drop, marks a
         season-reset discontinuity (``"reset": true``) that consumers must not
         compute deltas across. A ``rankedSeason`` change also marks a reset.
+    rotation_path : str | None
+        Where to keep the map-rotation windows seen so far (``map_rotation.json``).
+        Setting it turns on the map-rotation fetch (one ALS call when the stored
+        windows run out, or every 30 min); None leaves it off, as in unit tests.
     """
 
     def __init__(self, api_key, known_names, poll_seconds=30, platform="PC",
                  uids=None, on_poll=None, ledger_path=None,
-                 retention_days=14, reset_drop=800):
+                 retention_days=14, reset_drop=800, rotation_path=None):
         self._api_key = api_key
         self._names = list(known_names)
         self._poll_seconds = max(10, poll_seconds)
@@ -175,6 +195,18 @@ class RankTracker:
         # 5 req/s rate limit (each cycle already paces itself at 1 req/s).
         self._poll_lock = threading.Lock()
         self._stop = threading.Event()
+
+        # Map rotation windows: {mode: {start: {"start", "end", "map"}}}. ALS only
+        # gives the current and next window, so every window seen is kept (and saved
+        # to rotation_path) to answer "which map was up when this match began" after
+        # the rotation has moved on. Readers hold _rotation_lock.
+        self._rotation_path = rotation_path
+        self._rotation = {m: {} for m in ROTATION_MODES}
+        self._rotation_lock = threading.Lock()
+        self._rotation_fetched = 0.0   # last successful fetch
+        self._rotation_retry_at = 0.0  # no fetch before this (after a failure)
+        if self._rotation_path:
+            self._load_rotation()
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -271,12 +303,31 @@ class RankTracker:
             be a teammate who quit and already queued into another game.
         Players with no usable reading (not on the roster, EA privacy hiding
         presence, the tracker started late) are absent from the result."""
+        latest, ref, tie = self._this_match(names, at, anchor, after, need_legend=True)
+        if tie:
+            return {n: o["legend"] for n, o in latest.items() if o["since"] is None}
+        if ref is None:
+            return {n: o["legend"] for n, o in latest.items()}
+        return {n: o["legend"] for n, o in latest.items()
+                if o["since"] is None or abs(o["since"] - ref) <= _SINCE_TOLERANCE}
+
+    def match_start(self, names, at=None, anchor=None, after=None):
+        """Epoch the match that just ended at *at* began: the in-match since time its
+        players share, picked the same way as for :meth:`match_legends`. None when no
+        reading has one or the players split between two matches."""
+        _, ref, _ = self._this_match(names, at, anchor, after, need_legend=False)
+        return ref
+
+    def _this_match(self, names, at, anchor, after, need_legend):
+        """``(latest, ref, tie)`` for the match that just ended at *at*: each player's
+        latest usable in-match reading, the since time that identifies the match
+        (None when no reading has one), and whether two matches tied for it."""
         at = time.time() if at is None else float(at)
         with self._lock:
             latest = {}
             for n in dict.fromkeys(names):
                 o = self._last_in_match(n, at)
-                if o is None or not o["legend"]:
+                if o is None or (need_legend and not o["legend"]):
                     continue
                 if after is not None and (o["ts"] < after if o["since"] is None
                                           else o["since"] < after - 60):
@@ -284,19 +335,131 @@ class RankTracker:
                 latest[n] = o
         sinces = [o["since"] for o in latest.values() if o["since"] is not None]
         if not sinces:
-            return {n: o["legend"] for n, o in latest.items()}
+            return latest, None, False
         if anchor in latest and latest[anchor]["since"] is not None:
-            ref = latest[anchor]["since"]
-        else:
-            votes = {s: sum(abs(t - s) <= _SINCE_TOLERANCE for t in sinces) for s in sinces}
-            top = max(votes.values())
-            clusters = {min(t for t in sinces if abs(t - s) <= _SINCE_TOLERANCE)
-                        for s, v in votes.items() if v == top}
-            if len(clusters) > 1:
-                return {n: o["legend"] for n, o in latest.items() if o["since"] is None}
-            ref = next(s for s, v in votes.items() if v == top)
-        return {n: o["legend"] for n, o in latest.items()
-                if o["since"] is None or abs(o["since"] - ref) <= _SINCE_TOLERANCE}
+            return latest, latest[anchor]["since"], False
+        votes = {s: sum(abs(t - s) <= _SINCE_TOLERANCE for t in sinces) for s in sinces}
+        top = max(votes.values())
+        clusters = {min(t for t in sinces if abs(t - s) <= _SINCE_TOLERANCE)
+                    for s, v in votes.items() if v == top}
+        if len(clusters) > 1:
+            return latest, None, True
+        return latest, next(s for s, v in votes.items() if v == top), False
+
+    # ------------------------------------------------------------------ #
+    # Map rotation — which map each playlist had when a match began
+    # ------------------------------------------------------------------ #
+    def map_at(self, mode, epoch):
+        """The map *mode* (``"battle_royale"`` or ``"ranked"``) had at *epoch*, or
+        None when no stored window covers it."""
+        with self._rotation_lock:
+            for w in (self._rotation.get(mode) or {}).values():
+                if w["start"] <= epoch < w["end"]:
+                    return w["map"]
+        return None
+
+    def match_maps(self, names, at=None, anchor=None, after=None):
+        """``{mode: map}`` for the match that just ended at *at*, for every mode in
+        :data:`ROTATION_MODES` (a value is None when unknown).
+
+        The map is the one up when the match BEGAN, from the players' in-match since
+        time: a game that starts just before a rotation is logged after it. With no
+        since time, a map counts only when it was up for the whole span the match
+        could have started in: the last :data:`_MATCH_MAX_SECS`, cut to after the
+        previous logged match (*after*)."""
+        at = time.time() if at is None else float(at)
+        start = self.match_start(names, at=at, anchor=anchor, after=after)
+        out = {}
+        for mode in ROTATION_MODES:
+            if start is not None:
+                out[mode] = self.map_at(mode, start)
+                continue
+            lo = at - _MATCH_MAX_SECS
+            if after is not None:
+                lo = max(lo, float(after))
+            first, last = self.map_at(mode, lo), self.map_at(mode, at)
+            out[mode] = first if first is not None and first == last else None
+        return out
+
+    def _rotation_due(self, now):
+        """Whether to fetch the rotation now (caller holds no lock)."""
+        if not self._rotation_path or now < self._rotation_retry_at:
+            return False
+        if now - self._rotation_fetched >= _ROTATION_REFRESH:
+            return True
+        return any(self.map_at(m, now + _ROTATION_AHEAD) is None for m in ROTATION_MODES)
+
+    def _fetch_rotation(self):
+        """Fetch the ALS map rotation and store its windows. Never raises.
+
+        Every attempt, good or bad, holds off the next one for _ROTATION_RETRY: when
+        ALS answers but leaves a playlist uncovered (ranked between splits, no
+        ``next``), the coverage check would otherwise ask again every poll cycle."""
+        now = time.time()
+        self._rotation_retry_at = now + _ROTATION_RETRY
+        req = urllib.request.Request(_ALS_ROTATION, headers={
+            "Authorization": self._api_key,
+            "User-Agent": "apex-tracker",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            fetched = {m: _extract_windows(data, m) for m in ROTATION_MODES}
+        except Exception as exc:
+            _log(f"[RankTracker] map rotation fetch failed – {exc}")
+            return
+        if not any(fetched.values()):
+            _log("[RankTracker] map rotation: ALS sent no usable windows")
+            return
+        self._merge_rotation(fetched, now)
+        self._rotation_fetched = now
+        if self._rotation_path:
+            self._save_rotation()
+
+    def _merge_rotation(self, fetched, now):
+        """Store fetched windows. A fetch is the truth for the span it covers: stored
+        windows overlapping it are replaced (ALS can reshuffle a schedule mid-split)."""
+        with self._rotation_lock:
+            for mode, wins in fetched.items():
+                if not wins:
+                    continue
+                lo = min(w["start"] for w in wins)
+                hi = max(w["end"] for w in wins)
+                store = self._rotation.setdefault(mode, {})
+                for s in [s for s, w in store.items() if w["start"] < hi and w["end"] > lo]:
+                    del store[s]
+                for w in wins:
+                    store[w["start"]] = w
+                for s in [s for s, w in store.items() if w["end"] < now - _ROTATION_KEEP]:
+                    del store[s]
+
+    def _load_rotation(self):
+        """Seed the windows from rotation_path. A missing or bad file is ignored."""
+        try:
+            with open(self._rotation_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return
+        now = time.time()
+        with self._rotation_lock:
+            for mode in ROTATION_MODES:
+                for w in (saved.get(mode) or []) if isinstance(saved, dict) else []:
+                    w = _clean_window(w)
+                    if w and w["end"] >= now - _ROTATION_KEEP:
+                        self._rotation[mode][w["start"]] = w
+
+    def _save_rotation(self):
+        """Write the windows to rotation_path (atomic replace). Never raises."""
+        with self._rotation_lock:
+            snap = {m: sorted(self._rotation[m].values(), key=lambda w: w["start"])
+                    for m in ROTATION_MODES}
+        tmp = self._rotation_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f)
+            os.replace(tmp, self._rotation_path)
+        except OSError as exc:
+            _log(f"[RankTracker] map rotation save failed – {exc}")
 
     def in_match_recently(self, name, at=None):
         """Whether ALS saw *name* in a match within the last 45 min: True/False, or
@@ -414,11 +577,21 @@ class RankTracker:
         """Daemon loop: poll all players, sleep, repeat."""
         # Initial poll immediately on start.
         self._poll_all()
+        self._maybe_fetch_rotation()
         while not self._stop.is_set():
             self._stop.wait(self._poll_seconds)
             if self._stop.is_set():
                 break
             self._poll_all()
+            self._maybe_fetch_rotation()
+
+    def _maybe_fetch_rotation(self):
+        """Fetch the map rotation when due, under _poll_lock so the call can't land
+        in the same second as a player request (ALS rate limit)."""
+        if self._stop.is_set() or not self._rotation_due(time.time()):
+            return
+        with self._poll_lock:
+            self._fetch_rotation()
 
     def _poll_all(self):
         """Fetch RP for every player, sleeping 1 s between requests.
@@ -780,6 +953,34 @@ def _extract_name(data):
     except (KeyError, TypeError):
         return ""
     return str(name).strip() if name not in (None, "") else ""
+
+
+def _clean_window(w):
+    """One rotation window as ``{"start", "end", "map"}`` (epoch seconds), or None
+    when it lacks a usable map name or time span."""
+    try:
+        start, end = int(w["start"]), int(w["end"])
+        name = str(w["map"]).strip()
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not name or end <= start:
+        return None
+    return {"start": start, "end": end, "map": name}
+
+
+def _extract_windows(data, mode):
+    """The ``current`` and ``next`` windows ALS gives for *mode* in a maprotation
+    (version=2) response, cleaned; [] when the mode is missing."""
+    try:
+        block = data.get(mode) or {}
+    except AttributeError:
+        return []
+    out = []
+    for key in ("current", "next"):
+        w = _clean_window(block.get(key) or {}) if isinstance(block, dict) else None
+        if w:
+            out.append(w)
+    return out
 
 
 def _log(msg):
